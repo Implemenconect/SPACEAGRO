@@ -184,12 +184,6 @@ As chaves também podem ser cadastradas pelo painel de super admin, que as guard
 | `VITE_FORECAST_URL` | `https://spaceagro.pro/api/forecast` |
 | `FRED_API_KEY` | vazio |
 
-## Publicação
-
-- **Produção (spaceagro.pro):** cada push em `main` gera a imagem `ghcr.io/profgiancarllo/myroca:latest` ([.github/workflows/docker-image.yml](.github/workflows/docker-image.yml)). No Portainer, use **Update the stack** com **Re-pull image** para trocar o container.
-- **GitHub Pages:** cada push em `main` atualiza o mercado, faz o build e publica `dist/` no ramo `gh-pages` ([.github/workflows/publicar-site.yml](.github/workflows/publicar-site.yml)).
-- **Cloudflare Worker (alternativa):** cole `worker/estela-worker.js` no editor da Cloudflare e configure as chaves como Secrets ([worker/LEIA-ME.md](worker/LEIA-ME.md)).
-
 ## Atualização automática dos dados
 
 | Workflow | Quando | O que gera |

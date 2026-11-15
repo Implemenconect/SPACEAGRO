@@ -1,0 +1,891 @@
+import { FarmData, Talhao, DiaryEntry, DiaryEntryType } from '../types';
+import { getCurrentLanguage, t, translateCropName } from '../i18n';
+import { et } from './estelaText';
+import { playEstelaIntro, shouldShowIntro } from './EstelaIntro';
+import { estelaBaseUrl } from '../admin/server';
+import { buildFarmContext } from './farmContext';
+
+/** Chat minimizado na lateral (vale entre visitas). */
+const MIN_KEY = 'myroca_estela_min_v1';
+import { calculateTalhaoCropStatus, addDaysToDate } from '../utils/cropCalendar';
+import { fetchNasaSeries, polygonCentroid } from '../utils/nasaPower';
+import { assessPlanting } from '../utils/agronomyRules';
+import { resolveWeather } from '../utils/weather';
+import { fetchFarmForecast, sprayWindow, HourPoint } from '../utils/hourlyForecast';
+import { ht } from '../i18n/homeText';
+import { wt } from '../i18n/weatherText';
+import { cropKey } from '../utils/forecast';
+import { TranslationDictionary } from '../i18n/types';
+import { pq } from './pendText';
+import { computePending, auditDiary, Pending } from './pending';
+import { CROP_STANDARD_NAME, DEFAULT_CYCLE, asCropKey } from '../utils/rotation';
+import { calculateExpectedHarvestDate } from '../utils/cropCalendar';
+
+export interface EstelaOptions {
+  getFarm: () => FarmData;
+  getRefDate: () => string;
+  /** Chamado depois de gravar uma entrada no diário (salvar e atualizar telas). */
+  onDiaryAdded: (talhao: Talhao) => void;
+  openRotation: (talhaoId?: string) => void;
+  openDiary?: () => void;
+  getFireSummary?: () => object | null;
+  /** Abre a janela "Ver previsão completa" do cartão de clima. */
+  openWeather?: () => void;
+}
+
+interface Msg { who: 'me' | 'estela'; html: string; t?: string; actions?: { label: string; run: () => void }[] }
+
+const norm = (s: string) => s.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
+
+/**
+ * Resposta da IA pronta para o chat: **negrito** vira negrito de verdade, sobras de markdown (marcadores de lista, #, *, `)
+ * somem, cada linha vira um parágrafo e o rótulo do início da linha ("Atenção:", "Próximo passo:") fica em destaque.
+ * Devolve também o texto limpo para a voz (sem ler os símbolos).
+ */
+export function formatAnswer(raw: string): { html: string; speech: string } {
+  const lines = raw.replace(/\r/g, '').split(/\n+/)
+    .map((l) => l.replace(/^\s*(?:[-*•]|\d+[.)]|#{1,6})\s+/, '').trim())
+    .filter(Boolean);
+  const html = lines.map((l) => {
+    let h = esc(l).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>').replace(/[*`#]+/g, '');
+    if (!h.startsWith('<strong>')) h = h.replace(/^([^:<]{2,26}:)\s/, '<strong>$1</strong> ');
+    return `<p class="estela-p">${h}</p>`;
+  }).join('');
+  const speech = lines.map((l) => l.replace(/[*`#]+/g, '')).join(' ');
+  return { html, speech };
+}
+const LANG_TAG: Record<string, string> = { pt: 'pt-BR', es: 'es-ES', en: 'en-US', de: 'de-DE', fr: 'fr-FR' };
+
+const DIARY_RULES: [DiaryEntryType, RegExp, string | null][] = [
+  ['irrigacao', /irrig|riego|regar|irrigat|bewaesser|arros|灌溉|irrigu/, 'mm'],
+  ['chuva', /chuva|choveu|lluvia|llovio|\brain|pluie|regen|雨/, 'mm'],
+  ['adubacao', /adub|fertiliz|abono|engrais|duengung|duengen|施肥/, 'kg/ha'],
+  ['aplicacao', /aplica|defensiv|pulveriz|fungicid|herbicid|inseticid|spray|pestic|applic|施药/, 'L/ha'],
+  ['colheita', /colhe|colhi|cosech|harvest|recolt|ernte|收获/, 'sc/ha'],
+  ['plantio', /plantei|plantamos|plantio|sembr|siembra|semis|aussaat|播种|\bplanted\b|\bsowed\b/, null],
+  ['monitoramento', /monitor|vistori|scout|inspec|巡查/, null],
+  ['observacao', /observa|anota|nota\b|note\b|remarque|notiz|备注/, null],
+];
+/** Pergunta de clima/previsão (texto já sem acento e em minúsculas). */
+const WEATHER_Q = /clima|previsao do tempo|previsao de chuva|\btempo (agora|hoje|amanha|essa semana|esta semana|nos proximos)|como (esta|vai estar|vai ficar|fica) o tempo|vai chover|chove (hoje|amanha)|chover|chuva (hoje|amanha|essa semana|esta semana|na semana)|temperatura|\bvento|umidade|weather|forecast|will it rain|\brain (today|tomorrow)|pronostico|el tiempo|va a llover|llover|lluvia (hoy|manana)|wetter|regnet|regnen|meteo|quel temps|va-t-il pleuvoir|pleuvoir/;
+/** Exclui perguntas de previsão que não são do tempo (produtividade, colheita, preço). */
+const NOT_WEATHER = /produtiv|colheit|colher|safra|preco|yield|harvest|price|rendimiento|cosecha|ertrag|ernte|rendement|recolte/;
+/** Pergunta sobre a hora de pulverizar (janela de aplicação). */
+const SPRAY_Q = /(posso|pode|da pra|da para|hora de|horario de|janela de|quando|melhor hora para|bom para) (pulveriz|aplicar|passar veneno|passar defensivo)|janela de (pulverizacao|aplicacao)|can i spray|spray window|when (can i|to) spray|puedo (pulverizar|fumigar|aplicar)|ventana de aplicacion|kann ich spritzen|puis-je (pulveriser|traiter)/;
+
+/** Endereço da voz natural: a rota /tts do mesmo servidor da Estrela (definido no painel de administração ou em VITE_ESTELA_URL). */
+function voiceUrl(): string | null {
+  const base = estelaBaseUrl();
+  return base ? base + '/tts' : null;
+}
+
+const CANCEL_RE = /cancel|desist|anula|abbrech|annul|取消/;
+const SKIP_RE = /pular|depois|skip|later|omitir|despues|passer|plus tard|ueberspringen|spaeter|跳过|稍后|nao sei|no se|i do not know|i don't know|weiss nicht|je ne sais pas|不知道|ainda nao|todavia no|not yet|pas encore|noch nicht|还没有/;
+const YES_RE = /^(sim|s|ok|pode|claro|isso|confirm\w*|vamos|bora|yes|y|si|oui|ja|是|好|确认)(?![a-z])/;
+const NO_RE = /^(nao|n|cancel\w*|depois|agora nao|no|non|nein|later|不|取消)(?![a-z])/;
+const NOTHING_RE = /sem novidade|nada de novo|sem ocorrencia|nenhuma|nothing new|sin novedades|rien de neuf|nichts neues|没有新情况|^nada$|^nothing$/;
+const CROP_RE: [string, RegExp][] = [['soja', /soja|soy|大豆/], ['milho', /milho|corn|maiz|\bmais\b|玉米/], ['pasto', /pasto|pastagem|pasture|braquiaria|pâturage|pature|weide|牧草/], ['sorgo', /sorgo|sorghum|高粱/], ['feijao', /feijao|bean|frijol|haricot|bohne|豆/], ['algodao', /algodao|cotton|algodon|coton|baumwolle|棉/], ['trigo', /trigo|wheat|ble\b|weizen|小麦/], ['cana', /cana|sugarcane|caña|canne|zuckerrohr|甘蔗/]];
+const MONTHS: string[][] = [
+  ['janeiro', 'january', 'enero', 'janvier', 'januar'], ['fevereiro', 'february', 'febrero', 'fevrier', 'februar'], ['marco', 'march', 'marzo', 'mars', 'maerz'],
+  ['abril', 'april', 'abril', 'avril', 'april'], ['maio', 'may', 'mayo', 'mai', 'mai'], ['junho', 'june', 'junio', 'juin', 'juni'],
+  ['julho', 'july', 'julio', 'juillet', 'juli'], ['agosto', 'august', 'agosto', 'aout', 'august'], ['setembro', 'september', 'septiembre', 'septembre', 'september'],
+  ['outubro', 'october', 'octubre', 'octobre', 'oktober'], ['novembro', 'november', 'noviembre', 'novembre', 'november'], ['dezembro', 'december', 'diciembre', 'decembre', 'dezember'],
+];
+const RECORD_VERB = /registr|anot|lanc|record|log\b|enregistr|eintrag|记录|grav|apunt|note\b/;
+
+const DAY: Record<string, string> = { pt: 'Hoje', en: 'Today', es: 'Hoy' };
+const SPK_ON = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9v6h4l5 4V5L8 9H4z"/><path d="M16 9a4 4 0 0 1 0 6M18.5 6.5a7.5 7.5 0 0 1 0 11"/></svg>';
+const SPK_OFF = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9v6h4l5 4V5L8 9H4z"/><path d="M17 9l5 6M22 9l-5 6"/></svg>';
+
+export class EstelaChat {
+  private root!: HTMLElement;
+  private panel!: HTMLElement;
+  private list!: HTMLElement;
+  private input!: HTMLInputElement;
+  private msgs: Msg[] = [];
+  private open = false;
+  private recog: any = null;
+  private listening = false;
+  private speak = false;
+  private audio: HTMLAudioElement | null = null;
+  private voiceQueue: Promise<void> = Promise.resolve();
+  private voiceGen = 0;
+  private painted = 0;
+  private pendingDiary: { type: DiaryEntryType; amount?: number; date: string; talhaoId?: string; note?: string } | null = null;
+  private fromVoice = false;
+  private ask: Pending | null = null;
+  private amountAsked = false;
+  private skipped = new Set<string>();
+  private badgeTimer: number | undefined;
+
+  constructor(private opts: EstelaOptions) {
+    try { this.speak = localStorage.getItem('myroca_estela_voice_v1') === '1'; } catch { /* ignora */ }
+    this.mount();
+    this.refreshBadge();
+    this.badgeTimer = window.setInterval(() => this.refreshBadge(), 60000);
+  }
+
+  /** Número de pendências que a Estrela quer perguntar (mostrado no botão). */
+  public refreshBadge(): void {
+    const n = computePending(this.opts.getFarm(), this.ref(), this.skipped).length;
+    const el = this.root?.querySelector<HTMLElement>('#estela-badge');
+    if (el) { el.textContent = String(n); el.style.display = n ? 'inline-flex' : 'none'; }
+  }
+
+  // ---------------- UI
+  private mount(): void {
+    this.root = document.createElement('div');
+    this.root.id = 'estela-root';
+    const dock = document.getElementById('estela-dock');
+    (dock || document.body).appendChild(this.root);
+    this.renderShell();
+    // Na tela larga o chat fica fixo na lateral direita da visão geral, já aberto.
+    if (dock && window.matchMedia('(min-width: 1100px)').matches) {
+      document.body.classList.add('estela-docked');
+      let min = false;
+      try { min = localStorage.getItem(MIN_KEY) === '1'; } catch { /* ignora */ }
+      if (min) this.setMinimized(true); else this.toggle(true);
+    }
+  }
+
+  // ---------------- Minimizar (chat fixo na lateral): a coluna some e o mapa/painéis ocupam a tela
+  private isMinimized(): boolean { return document.body.classList.contains('estela-min'); }
+
+  public setMinimized(min: boolean): void {
+    document.body.classList.toggle('estela-min', min);
+    try { localStorage.setItem(MIN_KEY, min ? '1' : '0'); } catch { /* ignora */ }
+    if (min) {
+      this.open = false;
+      this.panel.style.display = 'none';
+      this.root.querySelector('#estela-fab')?.classList.remove('hidden');
+      this.root.querySelector('#estela-fab-mic')?.classList.add('hidden');
+      (this.root.querySelector('#estela-fab') as HTMLElement | null)?.focus();
+    } else {
+      this.toggle(true);
+    }
+    // o mapa e os painéis recalculam o tamanho com a coluna aberta/fechada
+    const relayout = () => { window.dispatchEvent(new Event('estela-layout')); window.dispatchEvent(new Event('resize')); };
+    requestAnimationFrame(() => requestAnimationFrame(relayout));
+    window.setTimeout(relayout, 250);
+  }
+
+  private renderShell(): void {
+    this.root.innerHTML = `
+      <button class="estela-fab" id="estela-fab" aria-label="${et('fab')}">
+        <span class="estela-fab-ico"><img class="estela-ico" src="./assets/brand/spaceagro-icon.svg" alt="" /></span><span class="estela-fab-txt">${et('fab')}</span><span class="estela-badge" id="estela-badge" style="display:none">0</span>
+      </button>
+      <button class="estela-fab-mic" id="estela-fab-mic" title="${et('mic')}" aria-label="${et('mic')}"><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></button>
+      <div class="estela-panel" id="estela-panel" style="display:none" role="dialog" aria-label="${et('title')}">
+        <div class="estela-head">
+          <div class="estela-title"><img class="estela-ico" src="./assets/brand/spaceagro-icon.svg" alt="" /><span class="estela-title-txt">${et('title').split('•').map((s, i) => (i ? `<small>${s.trim()}</small>` : `<b>${s.trim()}</b>`)).join('')}</span></div>
+          <div class="estela-head-btns">
+            ${voiceUrl() ? `<button id="estela-speak" title="${this.speak ? et('speakOn') : et('speakOff')}" aria-label="${this.speak ? et('speakOn') : et('speakOff')}">${this.speak ? SPK_ON : SPK_OFF}</button>` : ''}
+            <button id="estela-clear" title="${et('clear')}">${et('clear')}</button>
+            <button id="estela-min" type="button" title="${et('minimize')}" aria-label="${et('minimize')}"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg></button>
+            <button id="estela-close" title="${et('close')}">&times;</button>
+          </div>
+        </div>
+        <div class="estela-list" id="estela-list" aria-live="polite"></div>
+        <form class="estela-form" id="estela-form">
+          <div class="estela-type">
+            <input id="estela-input" type="text" autocomplete="off" placeholder="${et('placeholder')}" aria-label="${et('placeholder')}" />
+          </div>
+          <button type="button" class="estela-mic" id="estela-mic" title="${et('mic')}" aria-label="${et('mic')}"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></button>
+          <button type="submit" class="estela-send" title="${et('send')}" aria-label="${et('send')}"><svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true"><path d="M3.4 20.4 21 12 3.4 3.6l-.01 6.5L15 12 3.39 13.9z"/></svg></button>
+        </form>
+      </div>`;
+    this.panel = this.root.querySelector('#estela-panel')!;
+    this.list = this.root.querySelector('#estela-list')!;
+    this.input = this.root.querySelector('#estela-input')!;
+    this.root.querySelector('#estela-fab')!.addEventListener('click', () => (this.isMinimized() ? this.setMinimized(false) : this.toggle()));
+    this.root.querySelector('#estela-min')!.addEventListener('click', () => this.setMinimized(true));
+    this.root.querySelector('#estela-fab-mic')!.addEventListener('click', () => { this.fromVoice = true; this.toggle(true); if (!this.listening) this.toggleMic(); });
+    this.root.querySelector('#estela-close')!.addEventListener('click', () => this.toggle(false));
+    this.root.querySelector('#estela-clear')!.addEventListener('click', () => { this.msgs = []; this.painted = 0; this.pendingDiary = null; this.hello(); });
+    this.root.querySelector('#estela-speak')?.addEventListener('click', () => this.toggleSpeak());
+    this.root.querySelector('#estela-mic')!.addEventListener('click', () => this.toggleMic());
+    const formEl = this.root.querySelector<HTMLFormElement>('#estela-form')!;
+    this.input.addEventListener('input', () => formEl.classList.toggle('has-text', this.input.value.trim().length > 0));
+    formEl.onsubmit = (e) => {
+      e.preventDefault();
+      const v = this.input.value.trim();
+      if (v) { this.fromVoice = false; this.submit(v); }
+    };
+    this.paint();
+  }
+
+  /** Abre o chat (de fora, pela voz ou por outro botão). */
+  public show(prompt?: string): void {
+    this.toggle(true);
+    if (prompt) this.submit(prompt);
+  }
+
+  public refreshLanguage(): void {
+    const wasOpen = this.open;
+    this.renderShell();
+    if (wasOpen) this.toggle(true);
+  }
+
+  private toggle(force?: boolean): void {
+    this.open = force ?? !this.open;
+    this.panel.style.display = this.open ? 'flex' : 'none';
+    this.root.querySelector('#estela-fab')!.classList.toggle('hidden', this.open && window.innerWidth < 640);
+    this.root.querySelector('#estela-fab-mic')!.classList.toggle('hidden', this.open);
+    if (this.open) {
+      // Primeira conversa do dia: a Estrela se apresenta com animação; a saudação entra quando a apresentação some
+      if (shouldShowIntro()) {
+        playEstelaIntro(this.panel, {
+          speak: this.speak ? (t) => this.speakOut(t) : undefined,
+          onDone: () => { if (!this.msgs.length) this.hello(); this.input.focus(); },
+        });
+        return;
+      }
+      if (!this.msgs.length) this.hello();
+      setTimeout(() => this.input.focus(), 50);
+    } else {
+      this.stopMic();
+      this.stopVoice();
+    }
+  }
+
+  private hello(): void {
+    this.say(esc(et('hello')));
+    // Um único pedido por vez: pendências, ou então o histórico da fazenda
+    const n = computePending(this.opts.getFarm(), this.ref(), this.skipped).length;
+    if (n) { this.say(esc(pq('intro', { n })), [{ label: '' + pq('go'), run: () => this.startPending() }, { label: pq('later'), run: () => { /* nada */ } }]); return; }
+    const regs = this.opts.getFarm().talhoes.reduce((a, tl) => a + (tl.diary?.length || 0), 0);
+    this.say(esc(pq('hist', { n: regs })), [{ label: pq('histHere'), run: () => this.startPending() }, { label: pq('histLater'), run: () => { /* nada */ } }]);
+  }
+
+  // ---------------- Pendências guiadas
+  private startPending(): void {
+    this.skipped.clear();
+    this.nextPending();
+  }
+
+  private nextPending(): void {
+    this.refreshBadge();
+    const list = computePending(this.opts.getFarm(), this.ref(), this.skipped);
+    if (!list.length) { this.ask = null; this.say(esc(pq(this.msgs.length > 2 ? 'done' : 'none'))); return; }
+    const p = list[0];
+    this.ask = p;
+    const tl = this.talhoes().find((x) => x.id === p.talhaoId)!;
+    const key = p.kind === 'diary' && p.days === undefined ? 'q_diary_none' : 'q_' + p.kind;
+    this.say(esc(pq(key, { name: this.tName(tl), crop: translateCropName(tl.crop), d: p.days ?? 0 })), [
+      { label: pq('skip'), run: () => this.skipCurrent() },
+    ]);
+    this.listenSoon();
+  }
+
+  private skipCurrent(say = true): void {
+    if (this.ask) this.skipped.add(`${this.ask.kind}:${this.ask.talhaoId}`);
+    this.ask = null;
+    if (say) this.say(esc(pq('skipped')));
+    this.nextPending();
+  }
+
+  /** Quando o produtor está falando, o microfone volta a abrir sozinho para a resposta. */
+  private listenSoon(): void {
+    if (!this.fromVoice) return;
+    const go = () => { if (!this.listening && this.open) this.toggleMic(); };
+    const wait = () => {
+      if (this.isSpeaking()) setTimeout(wait, 300); else setTimeout(go, 400);
+    };
+    setTimeout(wait, 500);
+  }
+
+  private parseDateText(raw: string): string | null {
+    const n = norm(raw);
+    const ref = this.ref();
+    if (/\bhoje\b|\btoday\b|\bhoy\b|aujourd|\bheute\b|今天/.test(n)) return ref;
+    if (/ontem|yesterday|\bayer\b|\bhier\b|gestern|昨天/.test(n)) return addDaysToDate(ref, -1);
+    const ago = n.match(/(?:ha|hace|il y a|vor)\s*(\d{1,3})\s*(dias?|days?|jours?|tagen?)|(\d{1,3})\s*(?:dias?|days?)\s*(?:atras|ago)|(\d{1,3})\s*天前/);
+    if (ago) return addDaysToDate(ref, -Number(ago[1] || ago[3] || ago[4]));
+    const clamp = (y: number, m: number, d: number): string | null => {
+      if (m < 1 || m > 12 || d < 1 || d > 31) return null;
+      let iso = `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+      if (iso > ref) iso = `${y - 1}-${iso.slice(5)}`;
+      return iso;
+    };
+    const y0 = Number(ref.slice(0, 4));
+    const num = n.match(/\b(\d{1,2})\s*[\/.-]\s*(\d{1,2})(?:\s*[\/.-]\s*(\d{2,4}))?\b/);
+    if (num) {
+      const yy = num[3] ? (num[3].length === 2 ? 2000 + Number(num[3]) : Number(num[3])) : y0;
+      return clamp(yy, Number(num[2]), Number(num[1]));
+    }
+    const zh = raw.match(/(\d{1,2})\s*月\s*(\d{1,2})/);
+    if (zh) return clamp(y0, Number(zh[1]), Number(zh[2]));
+    for (let m = 0; m < 12; m++) {
+      for (const name of MONTHS[m]) {
+        const re = new RegExp(`(?:\\b(\\d{1,2})(?:st|nd|rd|th|o|er)?\\s*(?:de|of|d')?\\s*${name}\\b)|(?:${name}\\s*(\\d{1,2})\\b)`);
+        const mm = n.match(re);
+        if (mm) return clamp(y0, m + 1, Number(mm[1] || mm[2]));
+      }
+    }
+    const dia = n.match(/\b(?:dia|day|el dia|le|am)\s*(\d{1,2})\b/);
+    if (dia) {
+      const d = Number(dia[1]);
+      const rm = Number(ref.slice(5, 7));
+      const first = clamp(y0, rm, d);
+      return first;
+    }
+    return null;
+  }
+
+  /** Trata a resposta do produtor a uma pergunta de pendência. Retorna true se tratou. */
+  private handleAsk(text: string): boolean {
+    const p = this.ask;
+    if (!p) return false;
+    const n = norm(text);
+    const tl = this.talhoes().find((x) => x.id === p.talhaoId);
+    if (!tl) { this.ask = null; return false; }
+    const name = this.tName(tl);
+    const reAsk = () => { this.say(esc(pq('noparse')), [{ label: pq('skip'), run: () => this.skipCurrent() }]); this.listenSoon(); return true; };
+    const confirmSet = (what: string, apply: () => void): boolean => {
+      this.say(esc(pq('confirm', { what })), [
+        { label: '' + et('yes'), run: () => { apply(); this.opts.onDiaryAdded(tl); this.say(esc(pq('saved'))); this.ask = null; this.nextPending(); } },
+        { label: '' + et('no'), run: () => { this.say(esc(et('cancelled'))); this.ask = null; this.nextPending(); } },
+      ]);
+      return true;
+    };
+
+    if (SKIP_RE.test(n) && !/\d/.test(n)) {
+      if (p.kind === 'harvest' || p.kind === 'diary') this.say(esc(pq('notyet')));
+      this.skipCurrent(p.kind !== 'harvest' && p.kind !== 'diary');
+      return true;
+    }
+    if (p.kind === 'crop') {
+      const hit = CROP_RE.find(([, re]) => re.test(n));
+      if (!hit) return reAsk();
+      const key = asCropKey(hit[0]);
+      const std = CROP_STANDARD_NAME[key];
+      if (!std) return reAsk();
+      return confirmSet(`${name}: ${pq('f_crop')} = ${translateCropName(std)}`, () => { tl.crop = std; const c = DEFAULT_CYCLE[key]; if (c) tl.cycleDays = c; });
+    }
+    if (p.kind === 'planting') {
+      const d = this.parseDateText(text);
+      if (!d) return reAsk();
+      const df = `${d.slice(8, 10)}/${d.slice(5, 7)}/${d.slice(0, 4)}`;
+      return confirmSet(`${name}: ${pq('f_planting')} = ${df}`, () => {
+        tl.plantingDate = d;
+        if (!tl.cycleDays) { const c = DEFAULT_CYCLE[asCropKey(tl.crop)]; if (c) tl.cycleDays = c; }
+        if (tl.cycleDays) tl.harvestDateExpected = calculateExpectedHarvestDate(d, tl.cycleDays);
+      });
+    }
+    if (p.kind === 'cultivar') {
+      const v = text.trim().replace(/^(a |o |e |é |foi |plantei |cultivar |variedade )+/i, '').slice(0, 60);
+      if (v.length < 2 || /\d{1,2}\s*[\/.-]\s*\d{1,2}/.test(v)) return reAsk();
+      return confirmSet(`${name}: ${pq('f_cultivar')} = ${v}`, () => { tl.cultivar = v; });
+    }
+    if (p.kind === 'diary') {
+      if (NOTHING_RE.test(n)) {
+        return confirmSet(`${name}: ${pq('nothing')}`, () => {
+          tl.diary = [...(tl.diary || []), { id: 'diary_' + Date.now().toString(36), date: this.ref(), type: 'monitoramento', note: pq('nothing') }];
+        });
+      }
+      if (this.parseDiary(text, tl)) return true;
+      return reAsk();
+    }
+    if (p.kind === 'harvest') {
+      const d = this.parseDateText(text) || this.ref();
+      const stripped = n.replace(/\d{1,2}\s*[\/.-]\s*\d{1,2}(?:\s*[\/.-]\s*\d{2,4})?/g, ' ');
+      const am = stripped.match(/(\d+(?:[.,]\d+)?)\s*(?:sc|sacas?|sacos?|bags?)/) || stripped.match(/(\d{2,3}(?:[.,]\d+)?)\b/);
+      this.pendingDiary = { type: 'colheita', amount: am ? Number(am[1].replace(',', '.')) : undefined, date: d, talhaoId: tl.id };
+      this.confirmDiary();
+      return true;
+    }
+    return false;
+  }
+
+  private paint(): void {
+    this.list.innerHTML = this.msgs.length ? `<div class="estela-day">${DAY[(document.documentElement.lang || 'pt').slice(0, 2)] || DAY.en}</div>` : '';
+    const fresh = this.painted;
+    this.msgs.forEach((m, i) => {
+      const el = document.createElement('div');
+      el.className = `estela-msg ${m.who}`;
+      // só as mensagens novas entram com animação (em cascata quando chegam juntas)
+      if (i >= fresh) { el.classList.add('enter'); el.style.animationDelay = `${Math.min(i - fresh, 4) * 0.12}s`; }
+      el.innerHTML = m.html;
+      if (!m.t) m.t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      el.insertAdjacentHTML('beforeend', `<span class="estela-time">${m.t}${m.who === 'me' ? '<svg class="estela-ticks" viewBox="0 0 18 12" width="16" height="11" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 6.5 4.5 10 11 2M7 8.5 8.5 10 15 2"/></svg>' : ''}</span>`);
+      this.list.appendChild(el);
+    });
+    this.painted = this.msgs.length;
+    this.list.scrollTop = this.list.scrollHeight;
+  }
+
+  /** Opções que a pessoa responde escrevendo ("sim", "não", "depois"), sem botões. */
+  private choices: NonNullable<Msg['actions']> = [];
+
+  /** Mostra "Um instante…" e devolve a mensagem, para tirar só ela depois (mesmo com outras perguntas no meio). */
+  private wait(): Msg {
+    const m: Msg = { who: 'estela', html: esc(et('thinking')) };
+    this.msgs.push(m); this.paint();
+    return m;
+  }
+
+  private drop(m: Msg): void {
+    const i = this.msgs.indexOf(m);
+    if (i >= 0) { this.msgs.splice(i, 1); this.painted = Math.min(this.painted, this.msgs.length); }
+  }
+
+  private say(html: string, actions?: Msg['actions'], speakText?: string): void {
+    this.choices = actions || [];
+    this.msgs.push({ who: 'estela', html });
+    this.paint();
+    if (this.speak || this.fromVoice) this.speakOut(speakText ?? html.replace(/<[^>]+>/g, ' ').replace(/&[a-z]+;/g, ' '));
+  }
+
+  private submit(text: string): void {
+    this.stopVoice();
+    this.input.value = ''; this.root.querySelector('#estela-form')?.classList.remove('has-text');
+    this.msgs.push({ who: 'me', html: esc(text) });
+    this.paint();
+    void this.answer(text);
+  }
+
+  // ---------------- Voz
+  private toggleSpeak(): void {
+    this.speak = !this.speak;
+    try { localStorage.setItem('myroca_estela_voice_v1', this.speak ? '1' : '0'); } catch { /* ignora */ }
+    const b = this.root.querySelector<HTMLButtonElement>('#estela-speak')!;
+    b.innerHTML = this.speak ? SPK_ON : SPK_OFF;
+    b.title = this.speak ? et('speakOn') : et('speakOff');
+    b.setAttribute('aria-label', b.title);
+    if (!this.speak) this.stopVoice();
+  }
+
+  /**
+   * Voz natural da Estrela: o texto vai para a rota /tts do Worker (ElevenLabs; OpenAI como reserva) e volta como áudio.
+   * Sem Worker configurado não há voz (o narrador robótico do navegador foi removido).
+   * As falas tocam em fila, na ordem em que aparecem no chat.
+   */
+  private speakOut(text: string): void {
+    const url = voiceUrl();
+    const clean = text.replace(/\s+/g, ' ').trim().slice(0, 600);
+    if (!url || !clean) return;
+    const gen = this.voiceGen;
+    // já começa a gerar o áudio enquanto a fala anterior toca
+    const audio = fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: clean, lang: LANG_TAG[getCurrentLanguage()] || 'pt-BR' }),
+    }).then((r) => (r.ok ? r.blob() : null)).catch(() => null);
+    this.voiceQueue = this.voiceQueue.then(async () => {
+      const blob = await audio;
+      if (!blob || gen !== this.voiceGen) return;
+      await new Promise<void>((done) => {
+        const src = URL.createObjectURL(blob);
+        const a = new Audio(src);
+        this.audio = a;
+        const end = () => { URL.revokeObjectURL(src); if (this.audio === a) this.audio = null; done(); };
+        a.onended = end; a.onerror = end; a.onpause = () => { if (a.ended || gen !== this.voiceGen) end(); };
+        void a.play().catch(end);
+      });
+    });
+  }
+
+  /** Para a fala atual e descarta as que estavam na fila. */
+  private stopVoice(): void {
+    this.voiceGen++;
+    if (this.audio) { this.audio.pause(); this.audio = null; }
+    this.voiceQueue = Promise.resolve();
+  }
+
+  private isSpeaking(): boolean {
+    return !!this.audio && !this.audio.paused;
+  }
+
+  private toggleMic(): void {
+    if (this.listening) return this.stopMic();
+    const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SR) { this.say(esc(et('micNo'))); return; }
+    this.recog = new SR();
+    this.recog.lang = LANG_TAG[getCurrentLanguage()] || 'pt-BR';
+    this.recog.interimResults = true;
+    this.recog.maxAlternatives = 1;
+    let finalText = '';
+    this.recog.onresult = (e: any) => {
+      let txt = '';
+      for (let i = 0; i < e.results.length; i++) { txt += e.results[i][0].transcript; if (e.results[i].isFinal) finalText = txt; }
+      this.input.value = txt;
+    };
+    this.recog.onerror = (e: any) => {
+      this.listening = false; this.micUi();
+      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') this.say(esc(et('micDenied')));
+    };
+    this.recog.onend = () => {
+      this.listening = false; this.micUi();
+      const v = (finalText || this.input.value).trim();
+      if (v) { this.fromVoice = true; this.submit(v); }
+    };
+    try { this.recog.start(); this.listening = true; this.micUi(); this.input.placeholder = et('micOn'); } catch { this.listening = false; }
+  }
+  private stopMic(): void {
+    try { this.recog?.stop(); } catch { /* ignora */ }
+    this.listening = false; this.micUi();
+  }
+  private micUi(): void {
+    this.root.querySelector('#estela-mic')?.classList.toggle('on', this.listening);
+    const micTxt = this.root.querySelector('.estela-mic-txt');
+    if (micTxt) micTxt.textContent = this.listening ? et('micOn') : et('mic');
+    if (!this.listening) this.input.placeholder = et('placeholder');
+  }
+
+  // ---------------- Inteligência local
+  private ref(): string { return this.opts.getRefDate(); }
+  private talhoes(): Talhao[] { return this.opts.getFarm().talhoes; }
+  private tName = (tl: Talhao) => tl.name.replace(/\s*\[(Exemplo|Example|Ejemplo|Beispiel|Exemple|示例)\]\s*/i, '').trim();
+
+  private findTalhao(q: string): Talhao | null {
+    const list = this.talhoes();
+    const n = norm(q);
+    const num = n.match(/(?:talhao|field|campo|lote|parcela|parcelle|feld|地块)\s*0*(\d+)/) || (/^\s*0*(\d+)\s*$/.test(n) ? n.match(/0*(\d+)/) : null);
+    if (num) {
+      const k = Number(num[1]);
+      const hit = list.find((x) => { const d = x.name.match(/(\d+)/); return d && Number(d[1]) === k; }) || list[k - 1];
+      if (hit) return hit;
+    }
+    const byName = list.find((x) => n.includes(norm(this.tName(x))));
+    if (byName) return byName;
+    const ck = Object.entries({ soja: /soja|soy|大豆/, milho: /milho|corn|maiz|mais|玉米/, pasto: /pasto|pastagem|pasture/, sorgo: /sorgo|sorghum/, feijao: /feijao|bean|frijol/, algodao: /algodao|cotton/, trigo: /trigo|wheat/ })
+      .find(([, re]) => re.test(n));
+    if (ck) {
+      const m = list.filter((x) => cropKey(x.crop) === ck[0]);
+      if (m.length === 1) return m[0];
+    }
+    return null;
+  }
+
+  private parseDate(n: string): string {
+    const ref = this.ref();
+    if (/ontem|yesterday|ayer|gestern|\bhier\b|昨天/.test(n)) return addDaysToDate(ref, -1);
+    const dm = n.match(/\b(\d{1,2})[\/-](\d{1,2})\b/);
+    if (dm) return `${ref.slice(0, 4)}-${dm[2].padStart(2, '0')}-${dm[1].padStart(2, '0')}`;
+    return ref;
+  }
+
+  private async answer(text: string): Promise<void> {
+    const n = norm(text);
+    const farm = this.opts.getFarm();
+    try {
+      // 00) "sim" / "não" para a última pergunta da Estrela (sem botões, como no WhatsApp)
+      if (this.choices.length && n.split(/\s+/).length <= 4) {
+        const yesL = [et('yes'), pq('go'), pq('histHere'), pq('openRot')], noL = [et('no'), pq('later'), pq('histLater')];
+        const hit = YES_RE.test(n) ? this.choices.find((c) => yesL.includes(c.label)) : NO_RE.test(n) ? this.choices.find((c) => noL.includes(c.label)) : undefined;
+        if (hit) { this.choices = []; hit.run(); return; }
+      }
+      // 0) Resposta a uma pendência perguntada pela Estrela
+      if (this.ask && !this.pendingDiary && this.handleAsk(text)) return;
+      // 1) Resposta a "qual talhão?"
+      if (this.pendingDiary && this.amountAsked) {
+        const m = n.match(/(\d+(?:[.,]\d+)?)/);
+        if (m) this.pendingDiary.amount = Number(m[1].replace(',', '.'));
+        else if (!SKIP_RE.test(n)) return void this.say(esc(pq('noparse')));
+        this.amountAsked = false;
+        return this.confirmDiary();
+      }
+      if (this.pendingDiary && !this.pendingDiary.talhaoId) {
+        const tl = this.findTalhao(text);
+        if (tl) { this.pendingDiary.talhaoId = tl.id; return this.continueDiary(); }
+        if (CANCEL_RE.test(n) || SKIP_RE.test(n)) {
+          this.pendingDiary = null; this.amountAsked = false;
+          return void this.say(esc(et('cancelled')));
+        }
+        // Repetiu o pedido (ex.: "irrigação" de novo) sem dizer o talhão: aproveita o que veio e pergunta só o talhão, com dica
+        const rule = DIARY_RULES.find(([, re]) => re.test(n));
+        if (rule) {
+          this.pendingDiary.type = rule[0];
+          const am = n.replace(/(?:talhao|field|campo|lote|parcela|parcelle|feld|地块)\s*\d+/g, ' ').match(/(\d+(?:[.,]\d+)?)/);
+          if (rule[2] && am) this.pendingDiary.amount = Number(am[1].replace(',', '.'));
+          return void this.say(esc(et('talhaoHint', { n: farm.talhoes.length })), this.talhaoButtons());
+        }
+      }
+      // 2) Registro no diário
+      if (this.parseDiary(text)) return;
+      // 3a) Clima e previsão do tempo (antes do risco de plantio, a menos que a pergunta seja sobre plantar)
+      if (SPRAY_Q.test(n)) return this.weatherInfo(true);
+      if (WEATHER_Q.test(n) && !NOT_WEATHER.test(n) && !/plant|semea|sembr|\bsow/.test(n)) return this.weatherInfo(false);
+      // 3) Risco de plantio
+      if (/posso (plantar|semear)|plantar|semear|plantio|sow|plant\b|puedo sembrar|sembrar|semer|aussaat|säen|saeen|播种|risco/.test(n) && !/rotac|rotation|rotacion|轮作/.test(n)) return this.plantRisk(this.findTalhao(text));
+      // 4) Rotação
+      if (/rotac|rotation|rotacion|proxima safra|next season|proxima zafra|轮作|fruchtfolge/.test(n)) {
+        const tl = this.findTalhao(text);
+        this.say(esc(et('rotationOpen')));
+        this.opts.openRotation(tl?.id);
+        return;
+      }
+      // 4b) Data de hoje
+      if (/que dia|data de hoje|what day|what is the date|que fecha|welcher tag|quel jour|今天/.test(n)) {
+        const d = new Date();
+        const lang = LANG_TAG[getCurrentLanguage()] || 'pt-BR';
+        const real = d.toLocaleDateString(lang, { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+        const cal = this.ref();
+        const calTxt = `${cal.slice(8, 10)}/${cal.slice(5, 7)}/${cal.slice(0, 4)}`;
+        const realIso = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+        this.say(esc(real) + (cal !== realIso ? '<br><span class="estela-src">' + esc(et('calNote', { d: calTxt })) + '</span>' : ''), undefined, real);
+        return;
+      }
+      // 6) Situação dos talhões
+      if (/como (esta|estao|anda)|situacao|status|how are|estado|zustand|wie stehen|comment vont|怎么样|talhoes|fields|lotes|parcelles/.test(n)) return this.fieldStatus(this.findTalhao(text));
+      // 7) NASA
+      // sem IA configurada, explica as fontes; com IA, a pergunta vai para ela com os dados reais
+      if (/nasa/.test(n) && !estelaBaseUrl()) return void this.say(esc(et('nasaInfo')));
+      // 8) Ajuda
+      if (/ajuda|help|ayuda|hilfe|aide|帮助|o que voce faz|what can you/.test(n)) return void this.say(esc(et('help')));
+      // 9) IA externa (se configurada)
+      await this.askExternal(text);
+    } catch (err) {
+      console.error(err);
+      this.say(esc(et('extFail')));
+    }
+  }
+
+
+  /** Interpreta um registro de diário ditado/escrito. Com `forced`, o talhão já é conhecido. */
+  private parseDiary(text: string, forced?: Talhao): boolean {
+    const n = norm(text);
+    const farm = this.opts.getFarm();
+    const rule = DIARY_RULES.find(([, re]) => re.test(n));
+    const stripped = n.replace(/(?:talhao|field|campo|lote|parcela|parcelle|feld|地块)\s*\d+/g, ' ');
+    const amountM = stripped.match(/(\d+(?:[.,]\d+)?)\s*(mm|kg|litros?|l\b|sc|sacas?|sacos?)?/);
+    const hasQuestion = /posso|pode |devo|puedo|debo|can i|should i|peux|dois-je|kann ich|可以|\?/.test(n);
+    if (!rule || hasQuestion) return false;
+    if (!forced && !(RECORD_VERB.test(n) || (amountM && rule[2]))) return false;
+    const tl = forced || this.findTalhao(text);
+    this.pendingDiary = {
+      type: rule[0], amount: rule[2] && amountM ? Number(amountM[1].replace(',', '.')) : undefined,
+      date: this.parseDate(n), talhaoId: tl?.id, note: rule[2] ? undefined : text,
+    };
+    this.continueDiary();
+    return true;
+  }
+
+  /** Botões de escolha de talhão para o registro pendente (os 6 primeiros; os demais pelo número). */
+  private talhaoButtons(): Msg['actions'] {
+    return this.opts.getFarm().talhoes.slice(0, 6).map((x) => ({
+      label: this.tName(x),
+      run: () => { if (this.pendingDiary) { this.pendingDiary.talhaoId = x.id; this.continueDiary(); } },
+    }));
+  }
+
+  /** Completa o registro: talhão, quantidade (quando faz sentido) e confirmação. */
+  private continueDiary(): void {
+    const p = this.pendingDiary;
+    if (!p) return;
+    const farm = this.opts.getFarm();
+    if (!farm.talhoes.length) { this.say(esc(et('noTalhao'))); return; }
+    if (!p.talhaoId) {
+      if (farm.talhoes.length === 1) p.talhaoId = farm.talhoes[0].id;
+      else {
+        // Com muitos talhões, a lista completa no texto fica ilegível: pede o número e mostra os primeiros como botões
+        const ask = farm.talhoes.length > 6
+          ? et('askTalhaoMany', { n: farm.talhoes.length })
+          : et('askTalhao', { list: farm.talhoes.map((x) => this.tName(x)).join(', ') });
+        this.say(esc(ask), this.talhaoButtons());
+        return;
+      }
+    }
+    const unit = DIARY_RULES.find((r) => r[0] === p.type)?.[2];
+    if (unit && p.amount === undefined && !this.amountAsked) {
+      this.amountAsked = true;
+      this.say(esc(pq('q_amount', { type: et('diary_' + p.type), unit })));
+      this.listenSoon();
+      return;
+    }
+    this.amountAsked = false;
+    this.confirmDiary();
+  }
+
+  /** Chamado pelos botões grandes da tela simples (Chuva, Irrigação, ...). */
+  public quickRecord(type: DiaryEntryType): void {
+    this.toggle(true);
+    this.ask = null; this.amountAsked = false;
+    this.pendingDiary = { type, date: this.ref() };
+    this.msgs.push({ who: 'me', html: esc(et('diary_' + type)) });
+    this.paint();
+    this.continueDiary();
+  }
+
+  /** Abre o chat (para registrar o diário por conversa). */
+  public openChat(): void { this.toggle(true); }
+
+  /** Abre o chat já fazendo as perguntas pendentes. */
+  public askPending(): void {
+    this.toggle(true);
+    this.startPending();
+  }
+
+  /** Abre o chat e já liga o microfone. */
+  public listen(): void {
+    this.fromVoice = true;
+    this.toggle(true);
+    if (!this.listening) this.toggleMic();
+  }
+
+  public pendingCount(): number {
+    return computePending(this.opts.getFarm(), this.ref(), this.skipped).length;
+  }
+
+  private confirmDiary(): void {
+    const p = this.pendingDiary!;
+    const tl = this.talhoes().find((x) => x.id === p.talhaoId)!;
+    const unit = DIARY_RULES.find((r) => r[0] === p.type)?.[2];
+    const amount = p.amount !== undefined && unit ? ` ${p.amount} ${unit}` : '';
+    const d = `${p.date.slice(8, 10)}/${p.date.slice(5, 7)}/${p.date.slice(0, 4)}`;
+    this.say(esc(et('confirmDiary', { type: et('diary_' + p.type), amount, name: this.tName(tl), date: d })), [
+      { label: '' + et('yes'), run: () => this.saveDiary() },
+      { label: '' + et('no'), run: () => { this.pendingDiary = null; this.amountAsked = false; this.say(esc(et('cancelled'))); if (this.ask) { const a = this.ask; this.ask = null; this.skipped.add(`${a.kind}:${a.talhaoId}`); this.nextPending(); } } },
+    ]);
+  }
+
+  private saveDiary(): void {
+    const p = this.pendingDiary;
+    if (!p || !p.talhaoId) return;
+    const tl = this.talhoes().find((x) => x.id === p.talhaoId);
+    if (!tl) return;
+    const entry: DiaryEntry = { id: 'diary_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), date: p.date, type: p.type };
+    if (p.amount !== undefined) entry.amount = p.amount;
+    if (p.note) entry.note = p.note;
+    tl.diary = [...(tl.diary || []), entry];
+    this.pendingDiary = null;
+    this.opts.onDiaryAdded(tl);
+    this.say(esc(et('saved', { name: this.tName(tl) })));
+    this.refreshBadge();
+    if (entry.type === 'colheita') {
+      this.say(esc(pq('harvestSaved')), [{ label: pq('openRot'), run: () => this.opts.openRotation(tl.id) }]);
+    }
+    if (this.ask) { this.ask = null; this.nextPending(); }
+  }
+
+  private async plantRisk(only: Talhao | null): Promise<void> {
+    const targets = (only ? [only] : this.talhoes()).filter((x) => x.coordinates && x.coordinates.length >= 3 && !calculateTalhaoCropStatus(x, this.ref()).isPasture);
+    if (!targets.length) return void this.say(esc(et('noTalhao')));
+    this.say(esc(et('thinking')));
+    const lines: string[] = [];
+    for (const tl of targets.slice(0, 6)) {
+      try {
+        const c = polygonCentroid(tl.coordinates);
+        const series = await fetchNasaSeries(c.lat, c.lng, this.ref(), 30);
+        const phase = calculateTalhaoCropStatus(tl, this.ref()).phase.key;
+        const inCycle = !!tl.plantingDate && phase !== 'preparo';
+        const a = assessPlanting(series, this.ref(), tl.diary, inCycle);
+        const lvl = et(a.level === 'low' ? 'riskLow' : a.level === 'medium' ? 'riskMedium' : 'riskHigh');
+        const adviceKey = inCycle
+          ? a.level === 'low' ? 'agCropAdviceLow' : a.level === 'medium' ? 'agCropAdviceMedium' : 'agCropAdviceHigh'
+          : a.level === 'low' ? 'agAdviceLow' : a.level === 'medium' ? 'agAdviceMedium' : 'agAdviceHigh';
+        const bad = a.factors.filter((f) => f.severity > 0).slice(0, 2).map((f) => t(f.key as keyof TranslationDictionary, f.params));
+        lines.push(`<strong>${esc(this.tName(tl))}</strong> — ${esc(et('risk', { level: lvl }))}. ${esc(t(adviceKey as keyof TranslationDictionary))}${bad.length ? '<br><small>' + bad.map(esc).join(' ') + '</small>' : ''}`);
+      } catch {
+        lines.push(`<strong>${esc(this.tName(tl))}</strong> — ${esc(et('nasaFail'))}`);
+      }
+    }
+    this.say(`${esc(et('plantTitle'))}<br>${lines.join('<br><br>')}<br><br><span class="estela-src">${esc(et('nasaSrc'))}</span>`, undefined, lines.join('. ').replace(/<[^>]+>/g, ' '));
+  }
+
+  private fieldStatus(only: Talhao | null): void {
+    const list = only ? [only] : this.talhoes();
+    if (!list.length) return void this.say(esc(et('noTalhao')));
+    const lines = list.map((tl) => {
+      const st = calculateTalhaoCropStatus(tl, this.ref());
+      const days = tl.plantingDate && tl.cycleDays ? et('statusDays', { d: st.daysPassed, t: tl.cycleDays }) : tl.crop ? '' : et('statusNoCrop');
+      return `<strong>${esc(this.tName(tl))}</strong>: ${esc(translateCropName(tl.crop))}, ${esc(st.stageBadgeText)}. ${esc(days)}`;
+    });
+    this.say(lines.join('<br>'), undefined, lines.join('. ').replace(/<[^>]+>/g, ' '));
+  }
+
+  /**
+   * Clima e previsão com os mesmos dados do cartão "Clima na fazenda" (Open-Meteo por hora, no fuso da fazenda):
+   * agora, hoje (quando chove, máxima e mínima), amanhã e a janela de pulverização. Com `sprayFirst`, começa pela janela.
+   */
+  private async weatherInfo(sprayFirst = false): Promise<void> {
+    const tls = this.talhoes();
+    const c = tls.length && tls[0].coordinates?.length >= 3 ? polygonCentroid(tls[0].coordinates) : { lat: -17.8, lng: -51.07 };
+    const wait = this.wait();
+    const [fc, w] = await Promise.all([fetchFarmForecast(c.lat, c.lng).catch(() => null), resolveWeather(c.lat, c.lng, undefined, this.ref()).catch(() => null)]);
+    this.drop(wait);
+    if (!fc) {
+      // sem previsão por hora: só a condição atual (Open-Meteo, NASA POWER ou estimativa)
+      if (!w) return void this.say(esc(et('extFail')));
+      const temp = w.tempC !== null ? `${Math.round(w.tempC)}°C` : '';
+      const src = w.source === 'openmeteo' ? 'Open-Meteo' : w.source === 'nasa' ? `NASA POWER (${w.note || ''})` : w.source === 'manual' ? wt('srcManual') : wt('srcEstimate');
+      return void this.say(esc(et('weatherLine', { desc: et('wx_' + w.cond), temp, src })).replace(/, \./, '.'));
+    }
+    const pct = (v: number | null) => (v === null ? '—' : Math.round(v) + '%');
+    const today = fc.now.time.slice(0, 10);
+    const tomorrow = fc.days.find((d) => d.date > today)?.date;
+    const period = (h: HourPoint) => { const hr = Number(h.time.slice(11, 13)); return ht(hr < 12 ? 'morning' : hr < 18 ? 'afternoon' : 'night'); };
+    const maxmin = (date: string | undefined) => { const d = fc.days.find((x) => x.date === date); return d && d.tmax !== null && d.tmin !== null ? ht('maxmin', { max: Math.round(d.tmax), min: Math.round(d.tmin) }) : ''; };
+    const dayRain = (date: string | undefined) => {
+      const hs = fc.hours.filter((h) => h.time.slice(0, 10) === date);
+      const pops = hs.map((h) => h.pop).filter((v): v is number => v !== null);
+      return { hs, pop: pops.length ? Math.max(...pops) : null, mm: hs.reduce((s, h) => s + (h.precip ?? 0), 0) };
+    };
+    const manual = w?.source === 'manual';
+    const cond = manual ? w!.cond : fc.now.cond;
+    const temp = fc.now.temp ?? w?.tempC ?? null;
+    const lines: string[] = [];
+    // agora
+    lines.push(`${ht('now')}: ${et('wx_' + cond)}${temp === null ? '' : ', ' + Math.round(temp) + '°C'}. ${ht('pop')} ${pct(fc.now.pop)}, ${ht('wind').toLowerCase()} ${fc.now.wind === null ? '—' : Math.round(fc.now.wind) + ' km/h'}, ${ht('hum').toLowerCase()} ${pct(fc.now.hum)}.`);
+    // hoje: quando deve chover + máxima e mínima
+    const t0 = dayRain(today);
+    const wet0 = t0.hs.find((h) => (h.pop ?? 0) >= 50);
+    lines.push(`${cap(ht('today'))}: ${wet0 ? ht('rainAt', { p: period(wet0) }) : et('wxNoRain')} ${maxmin(today)}`.trim());
+    // amanhã
+    if (tomorrow) {
+      const t1 = dayRain(tomorrow);
+      const wet1 = t1.hs.find((h) => (h.pop ?? 0) >= 50);
+      const rain1 = wet1 ? `${ht('rainAt', { p: period(wet1) })} ${ht('pop')} ${pct(t1.pop)}${t1.mm >= 0.5 ? `, ${Math.round(t1.mm)} mm` : ''}.` : et('wxNoRain');
+      lines.push(`${ht('tomorrow')}: ${rain1} ${maxmin(tomorrow)}`.trim());
+    }
+    // janela de pulverização (mesma regra do cartão)
+    const win = sprayWindow(fc.hours);
+    const endH = win ? `${String((Number(win.end.slice(11, 13)) + 1) % 24).padStart(2, '0')}:00` : '';
+    const spray = `${ht('spray')}: ${win ? `${win.start.slice(0, 10) === today ? ht('today') : ht('tomorrowLc')} ${win.start.slice(11, 16)} – ${endH}` : ht('sprayNone')}.`;
+    if (sprayFirst) lines.unshift(spray + ' ' + et('wxSprayRule')); else lines.push(spray);
+    const src = `Open-Meteo${manual ? ' · ' + wt('srcManual') : ''}`;
+    const html = lines.map((l, i) => `<p class="estela-p">${i === 0 || /:/.test(l) ? esc(l).replace(/^([^:]{2,26}:)\s/, '<strong>$1</strong> ') : esc(l)}</p>`).join('');
+    const actions = this.opts.openWeather ? [{ label: ht('wxMore'), run: () => this.opts.openWeather!() }] : undefined;
+    this.say(html + `<span class="estela-src">${esc(et('wxSrc', { src }))}</span>`, actions, lines.join(' '));
+  }
+
+  // ---------------- IA externa (opcional)
+  private async askExternal(text: string): Promise<void> {
+    const url = estelaBaseUrl();
+    if (!url) return void this.say(esc(et('fallbackLocal')));
+    const wait = this.wait();
+    const farm = this.opts.getFarm();
+    const now = new Date();
+    const hoje = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    // Todos os dados reais da fazenda: clima observado (NASA POWER), balanço hídrico, previsão do tempo,
+    // satélite (Landsat e ECOSTRESS) e histórico de produtividade. O talhão citado na pergunta vai primeiro.
+    const ctx = await buildFarmContext(farm, { name: this.tName, refDate: this.ref(), today: hoje }, {
+      dataDeHojeReal: hoje,
+      avisoDatas: 'dataDeHojeReal é a data de hoje de verdade. dataDoCalendarioDaFazenda é só a data simulada do calendário agrícola do app (pode estar diferente de hoje). Se perguntarem que dia é hoje, responda dataDeHojeReal.',
+      dataDoCalendarioDaFazenda: this.ref(),
+      language: getCurrentLanguage(),
+      pendencias: computePending(farm, this.ref(), new Set()).map((p) => ({ talhao: this.tName(farm.talhoes.find((x) => x.id === p.talhaoId)!), tipo: p.kind, diasAtraso: p.days })),
+      alertaQueimadas: this.opts.getFireSummary?.() ?? undefined,
+      problemasDoDiario: auditDiary(farm, hoje).slice(0, 25).map((i) => ({ talhao: this.tName(farm.talhoes.find((x) => x.id === i.talhaoId)!), codigo: i.code, detalhe: i.detail })),
+    }, this.findTalhao(text));
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 45000);
+    try {
+      const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question: text, context: ctx }), signal: ctrl.signal });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const j = await res.json();
+      const ans = String(j.answer || '').trim();
+      if (!ans) throw new Error('empty');
+      this.drop(wait);
+      const out = formatAnswer(ans);
+      this.say(out.html + `<span class="estela-src">${esc(et('extNotice'))}</span>`, undefined, out.speech);
+    } catch {
+      this.drop(wait);
+      this.say(esc(et('extFail')));
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+}

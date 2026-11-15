@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "myroca-dev",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev"],
+      "port": 3000
+    },
+    {
+      "name": "myroca-landing",
+      "runtimeExecutable": "/Users/wesleysousa/.local/node/node-v22.23.4-darwin-arm64/bin/node",
+      "runtimeArgs": ["node_modules/vite/bin/vite.js", "--port=3011", "--strictPort"],
+      "port": 3011
+    }
+  ]
+}

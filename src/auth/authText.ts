@@ -1,0 +1,105 @@
+import { getCurrentLanguage } from '../i18n';
+
+type Dict = Record<string, string>;
+const en: Dict = {
+  title: 'Access to SpaceAgro', subtitle: 'Sign in or create your account to manage your farm.',
+  tabLogin: 'Sign in', tabSignup: 'Create account',
+  name: 'Full name', email: 'E-mail', phone: 'Phone (optional)', farm: 'Farm name', city: 'City / State',
+  password: 'Password', password2: 'Repeat password', passwordHint: 'At least 8 characters, with letters and numbers.',
+  keep: 'Keep me signed in on this device',
+  consent: 'I agree that SpaceAgro stores my data on this device to run the app (LGPD).',
+  btnLogin: 'Sign in', btnSignup: 'Create account and enter', guest: 'Explore without an account (demo)',
+  forgot: 'Forgot my password', forgotMsg: 'In this demo version the account lives only on this device, so the password cannot be recovered. You can delete this account and its data and create it again.',
+  forgotDelete: 'Delete this account and its data', forgotDone: 'Account deleted. You can create it again.',
+  localNote: 'Demo mode: accounts and farm data stay saved in this browser only.',
+  errRequired: 'Fill in all required fields.', errEmail: 'Enter a valid e-mail.', errPwShort: 'Password needs at least 8 characters, with letters and numbers.',
+  errPwMismatch: 'The passwords do not match.', errConsent: 'You need to accept the data use to create an account.',
+  errExists: 'There is already an account with this e-mail.', errBadLogin: 'Wrong e-mail or password.',
+  errLocked: 'Too many attempts. Try again in {s} s.', errCrypto: 'This browser cannot protect passwords. Open the app over HTTPS.',
+  heroTitle: 'Farm management built on satellite imagery', heroText: 'Fields, crop calendar and weather for your property in one place.', feat1: 'Field mapping over satellite imagery', feat2: 'Crop calendar and rotation planning', feat3: 'Rainfall and climate from NASA POWER', sources: 'Imagery: Esri World Imagery · Climate: NASA POWER',
+  cloudNote: 'Your account and farm data are saved on the SpaceAgro server and available on any device.', forgotCloud: 'Ask the SpaceAgro administrator to reset your password. You will receive a temporary password to sign in and change it.', errOffline: 'No connection to the server. Check your internet and try again.', errServer: 'The server could not complete the request. Try again in a moment.',
+  logout: 'Sign out', guestName: 'Guest', back: 'Back to home page',
+};
+const pt: Dict = {
+  title: 'Acesso ao SpaceAgro', subtitle: 'Entre ou crie sua conta para gerenciar sua fazenda.',
+  tabLogin: 'Entrar', tabSignup: 'Criar conta',
+  name: 'Nome completo', email: 'E-mail', phone: 'Telefone (opcional)', farm: 'Nome da fazenda', city: 'Cidade / UF',
+  password: 'Senha', password2: 'Repita a senha', passwordHint: 'Pelo menos 8 caracteres, com letras e números.',
+  keep: 'Manter conectado neste aparelho',
+  consent: 'Concordo que o SpaceAgro guarde meus dados neste aparelho para funcionar (LGPD).',
+  btnLogin: 'Entrar', btnSignup: 'Criar conta e entrar', guest: 'Conhecer sem conta (demonstração)',
+  forgot: 'Esqueci minha senha', forgotMsg: 'Nesta versão de demonstração a conta existe só neste aparelho, então a senha não pode ser recuperada. Você pode apagar esta conta e os dados dela e criar de novo.',
+  forgotDelete: 'Apagar esta conta e os dados', forgotDone: 'Conta apagada. Você pode criar de novo.',
+  localNote: 'Modo demonstração: contas e dados da fazenda ficam salvos só neste navegador.',
+  errRequired: 'Preencha todos os campos obrigatórios.', errEmail: 'Informe um e-mail válido.', errPwShort: 'A senha precisa de pelo menos 8 caracteres, com letras e números.',
+  errPwMismatch: 'As senhas não são iguais.', errConsent: 'É preciso aceitar o uso dos dados para criar a conta.',
+  errExists: 'Já existe uma conta com este e-mail.', errBadLogin: 'E-mail ou senha incorretos.',
+  errLocked: 'Muitas tentativas. Tente de novo em {s} s.', errCrypto: 'Este navegador não consegue proteger senhas. Abra o app por HTTPS.',
+  heroTitle: 'Gestão da fazenda a partir de imagens de satélite', heroText: 'Talhões, calendário de safra e clima da sua propriedade em um só lugar.', feat1: 'Mapeamento de talhões sobre imagem de satélite', feat2: 'Calendário de safra e planejamento de rotação', feat3: 'Chuva e clima com dados da NASA POWER', sources: 'Imagens: Esri World Imagery · Clima: NASA POWER',
+  cloudNote: 'Sua conta e os dados da fazenda ficam salvos no servidor do SpaceAgro e abrem em qualquer aparelho.', forgotCloud: 'Peça ao administrador do SpaceAgro para redefinir sua senha. Você recebe uma senha provisória para entrar e trocar.', errOffline: 'Sem conexão com o servidor. Confira a internet e tente de novo.', errServer: 'O servidor não conseguiu concluir agora. Tente de novo em instantes.',
+  logout: 'Sair', guestName: 'Visitante', back: 'Voltar à página inicial',
+};
+const es: Dict = {
+  title: 'Acceso a SpaceAgro', subtitle: 'Inicia sesión o crea tu cuenta para gestionar tu finca.',
+  tabLogin: 'Entrar', tabSignup: 'Crear cuenta',
+  name: 'Nombre completo', email: 'Correo electrónico', phone: 'Teléfono (opcional)', farm: 'Nombre de la finca', city: 'Ciudad / Estado',
+  password: 'Contraseña', password2: 'Repite la contraseña', passwordHint: 'Al menos 8 caracteres, con letras y números.',
+  keep: 'Mantener la sesión en este dispositivo',
+  consent: 'Acepto que SpaceAgro guarde mis datos en este dispositivo para funcionar (LGPD).',
+  btnLogin: 'Entrar', btnSignup: 'Crear cuenta y entrar', guest: 'Conocer sin cuenta (demostración)',
+  forgot: 'Olvidé mi contraseña', forgotMsg: 'En esta versión de demostración la cuenta existe solo en este dispositivo, por lo que la contraseña no se puede recuperar. Puedes borrar esta cuenta y sus datos y crearla de nuevo.',
+  forgotDelete: 'Borrar esta cuenta y sus datos', forgotDone: 'Cuenta borrada. Puedes crearla de nuevo.',
+  localNote: 'Modo demostración: las cuentas y los datos de la finca se guardan solo en este navegador.',
+  errRequired: 'Completa todos los campos obligatorios.', errEmail: 'Ingresa un correo válido.', errPwShort: 'La contraseña necesita al menos 8 caracteres, con letras y números.',
+  errPwMismatch: 'Las contraseñas no coinciden.', errConsent: 'Debes aceptar el uso de los datos para crear la cuenta.',
+  errExists: 'Ya existe una cuenta con este correo.', errBadLogin: 'Correo o contraseña incorrectos.',
+  errLocked: 'Demasiados intentos. Inténtalo de nuevo en {s} s.', errCrypto: 'Este navegador no puede proteger contraseñas. Abre la app por HTTPS.',
+  heroTitle: 'Gestión de la finca a partir de imágenes satelitales', heroText: 'Lotes, calendario de cosecha y clima de tu propiedad en un solo lugar.', feat1: 'Mapeo de lotes sobre imagen satelital', feat2: 'Calendario de cosecha y planificación de rotación', feat3: 'Lluvia y clima con datos de NASA POWER', sources: 'Imágenes: Esri World Imagery · Clima: NASA POWER',
+  cloudNote: 'Tu cuenta y los datos de la finca se guardan en el servidor de SpaceAgro y se abren en cualquier dispositivo.', forgotCloud: 'Pide al administrador de SpaceAgro que restablezca tu contraseña. Recibirás una contraseña temporal para entrar y cambiarla.', errOffline: 'Sin conexión con el servidor. Revisa tu internet e inténtalo de nuevo.', errServer: 'El servidor no pudo completar la solicitud. Inténtalo de nuevo en un momento.',
+  logout: 'Salir', guestName: 'Invitado', back: 'Volver a la página inicial',
+};
+const de: Dict = {
+  title: 'Zugang zu SpaceAgro', subtitle: 'Melden Sie sich an oder erstellen Sie Ihr Konto, um Ihren Betrieb zu verwalten.',
+  tabLogin: 'Anmelden', tabSignup: 'Konto erstellen',
+  name: 'Vollständiger Name', email: 'E-Mail', phone: 'Telefon (optional)', farm: 'Name des Betriebs', city: 'Stadt / Bundesstaat',
+  password: 'Passwort', password2: 'Passwort wiederholen', passwordHint: 'Mindestens 8 Zeichen, mit Buchstaben und Zahlen.',
+  keep: 'Auf diesem Gerät angemeldet bleiben',
+  consent: 'Ich stimme zu, dass SpaceAgro meine Daten zur Nutzung auf diesem Gerät speichert (LGPD).',
+  btnLogin: 'Anmelden', btnSignup: 'Konto erstellen und starten', guest: 'Ohne Konto ausprobieren (Demo)',
+  forgot: 'Passwort vergessen', forgotMsg: 'In dieser Demoversion existiert das Konto nur auf diesem Gerät, das Passwort kann daher nicht wiederhergestellt werden. Sie können dieses Konto samt Daten löschen und neu anlegen.',
+  forgotDelete: 'Dieses Konto und seine Daten löschen', forgotDone: 'Konto gelöscht. Sie können es neu anlegen.',
+  localNote: 'Demomodus: Konten und Betriebsdaten werden nur in diesem Browser gespeichert.',
+  errRequired: 'Bitte alle Pflichtfelder ausfüllen.', errEmail: 'Bitte eine gültige E-Mail eingeben.', errPwShort: 'Das Passwort braucht mindestens 8 Zeichen, mit Buchstaben und Zahlen.',
+  errPwMismatch: 'Die Passwörter stimmen nicht überein.', errConsent: 'Zum Erstellen des Kontos muss der Datennutzung zugestimmt werden.',
+  errExists: 'Mit dieser E-Mail existiert bereits ein Konto.', errBadLogin: 'E-Mail oder Passwort falsch.',
+  errLocked: 'Zu viele Versuche. Erneut versuchen in {s} s.', errCrypto: 'Dieser Browser kann Passwörter nicht schützen. App über HTTPS öffnen.',
+  heroTitle: 'Betriebsführung auf Basis von Satellitenbildern', heroText: 'Schläge, Anbaukalender und Wetter Ihres Betriebs an einem Ort.', feat1: 'Schlagkartierung auf Satellitenbildern', feat2: 'Anbaukalender und Fruchtfolgeplanung', feat3: 'Niederschlag und Klima aus NASA POWER', sources: 'Bilder: Esri World Imagery · Klima: NASA POWER',
+  cloudNote: 'Ihr Konto und die Betriebsdaten werden auf dem SpaceAgro-Server gespeichert und sind auf jedem Gerät verfügbar.', forgotCloud: 'Bitten Sie den SpaceAgro-Administrator, Ihr Passwort zurückzusetzen. Sie erhalten ein vorläufiges Passwort zum Anmelden und Ändern.', errOffline: 'Keine Verbindung zum Server. Prüfen Sie das Internet und versuchen Sie es erneut.', errServer: 'Der Server konnte die Anfrage nicht abschließen. Versuchen Sie es gleich noch einmal.',
+  logout: 'Abmelden', guestName: 'Gast', back: 'Zurück zur Startseite',
+};
+const fr: Dict = {
+  title: 'Accès à SpaceAgro', subtitle: 'Connectez-vous ou créez votre compte pour gérer votre exploitation.',
+  tabLogin: 'Se connecter', tabSignup: 'Créer un compte',
+  name: 'Nom complet', email: 'E-mail', phone: 'Téléphone (facultatif)', farm: "Nom de l'exploitation", city: 'Ville / État',
+  password: 'Mot de passe', password2: 'Répétez le mot de passe', passwordHint: 'Au moins 8 caractères, avec lettres et chiffres.',
+  keep: 'Rester connecté sur cet appareil',
+  consent: "J'accepte que SpaceAgro enregistre mes données sur cet appareil pour fonctionner (LGPD).",
+  btnLogin: 'Se connecter', btnSignup: 'Créer le compte et entrer', guest: 'Découvrir sans compte (démo)',
+  forgot: "Mot de passe oublié", forgotMsg: "Dans cette version de démonstration, le compte n'existe que sur cet appareil : le mot de passe ne peut pas être récupéré. Vous pouvez supprimer ce compte et ses données, puis le recréer.",
+  forgotDelete: 'Supprimer ce compte et ses données', forgotDone: 'Compte supprimé. Vous pouvez le recréer.',
+  localNote: "Mode démo : comptes et données de l'exploitation restent enregistrés dans ce navigateur uniquement.",
+  errRequired: 'Remplissez tous les champs obligatoires.', errEmail: 'Saisissez un e-mail valide.', errPwShort: 'Le mot de passe doit avoir au moins 8 caractères, avec lettres et chiffres.',
+  errPwMismatch: 'Les mots de passe ne correspondent pas.', errConsent: "Vous devez accepter l'utilisation des données pour créer le compte.",
+  errExists: 'Un compte existe déjà avec cet e-mail.', errBadLogin: 'E-mail ou mot de passe incorrect.',
+  errLocked: 'Trop de tentatives. Réessayez dans {s} s.', errCrypto: "Ce navigateur ne peut pas protéger les mots de passe. Ouvrez l'app en HTTPS.",
+  heroTitle: "Gestion de l'exploitation à partir d'images satellite", heroText: 'Parcelles, calendrier cultural et météo de votre exploitation au même endroit.', feat1: 'Cartographie des parcelles sur image satellite', feat2: 'Calendrier cultural et planification des rotations', feat3: 'Pluie et climat avec les données NASA POWER', sources: 'Images : Esri World Imagery · Climat : NASA POWER',
+  cloudNote: 'Votre compte et les données de l’exploitation sont enregistrés sur le serveur SpaceAgro et accessibles sur tout appareil.', forgotCloud: 'Demandez à l’administrateur SpaceAgro de réinitialiser votre mot de passe. Vous recevrez un mot de passe provisoire pour vous connecter et le changer.', errOffline: 'Pas de connexion au serveur. Vérifiez internet et réessayez.', errServer: 'Le serveur n’a pas pu terminer la demande. Réessayez dans un instant.',
+  logout: 'Se déconnecter', guestName: 'Invité', back: "Retour à la page d'accueil",
+};
+const ALL: Record<string, Dict> = { en, pt, es, de, fr };
+
+export function at(key: string, params?: Record<string, string | number>): string {
+  let s = (ALL[getCurrentLanguage()] || en)[key] ?? en[key] ?? key;
+  if (params) for (const [k, v] of Object.entries(params)) s = s.replace(`{${k}}`, String(v));
+  return s;
+}

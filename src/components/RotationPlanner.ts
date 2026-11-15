@@ -1,0 +1,630 @@
+import { FarmData, Talhao, RotationStrategyData } from '../types';
+import { translateCropName } from '../i18n';
+import { rt } from '../i18n/rotationText';
+import {
+  CROP_KEYS, CROP_STANDARD_NAME, CropKey, DEFAULT_CYCLE, Evaluation, Finding, asCropKey,
+  defaultStrategies, defaultSummerSow, evaluateStrategy, newCustomStrategy, ROTATION_RULES,
+} from '../utils/rotation';
+import { assessPlanting } from '../utils/agronomyRules';
+import { fetchNasaSeries, polygonCentroid } from '../utils/nasaPower';
+import { waterForPoint } from '../utils/waterRisk';
+import { addDaysToDate, calculateTalhaoCropStatus } from '../utils/cropCalendar';
+import { mt } from '../i18n/marketText';
+import { mk2 } from '../i18n/mercadoText';
+import { sf } from '../i18n/safraText';
+import { decide, Decision, focusTalhao } from '../utils/decision';
+import { currentForecast } from '../utils/forecast';
+import { calculateExpectedHarvestDate, diffDays, getCropColor } from '../utils/cropCalendar';
+import {
+  clearOverrides, cropMarket, currentMarket, hasOverrides, loadMarket, setOverride, slotMargin, strategyMargin,
+  Scenario, StrategyMargin,
+} from '../utils/market';
+import { curSymbol, fromCur, money, toCur } from '../utils/currency';
+const round2 = (v: number): number => Math.round(v * 100) / 100;
+
+export interface RotationPlannerOptions {
+  getFarm: () => FarmData;
+  getRefDate: () => string;
+  /** Chamado quando algo deve ser salvo (estratégias editadas ou próxima safra adotada). */
+  onChange: (talhao: Talhao, adopted: boolean) => void;
+}
+
+export const fmtMoney = (v: number): string => `${v < 0 ? '−' : ''}${money(Math.abs(v), 0)}`;
+const cropLabel = (c: CropKey): string => {
+  if (c === 'cobertura') return rt('cover').split(' (')[0];
+  if (c === 'pousio') return rt('fallow').split(' (')[0];
+  return translateCropName(CROP_STANDARD_NAME[c]);
+};
+const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
+const fmtDate = (iso: string) => `${iso.slice(8, 10)}/${iso.slice(5, 7)}/${iso.slice(0, 4)}`;
+
+export class RotationPlanner {
+  private root: HTMLElement | null = null;
+  private talhaoId = '';
+  private nasa: { level: 'low' | 'medium' | 'high'; rain15: number } | null = null;
+  private nasaState: 'idle' | 'loading' | 'ok' | 'fail' = 'idle';
+  private nasaToken = 0;
+  private stress = 0;
+  private tab: 'current' | 'switch' = 'switch';
+  private detailsOpen = false;
+
+  constructor(private opts: RotationPlannerOptions) {}
+
+  open(talhaoId?: string, tab: 'current' | 'switch' = 'switch'): void {
+    this.tab = tab;
+    this.detailsOpen = false;
+    const farm = this.opts.getFarm();
+    if (!farm.talhoes.length) {
+      this.ensureRoot();
+      this.root!.innerHTML = `<div class="rot-card"><div class="rot-head"><h2>${rt('title')}</h2><button class="rot-x" data-act="close">&times;</button></div><p>${rt('noTalhao')}</p></div>`;
+      this.root!.style.display = 'flex';
+      this.bindClose();
+      return;
+    }
+    this.talhaoId = talhaoId && farm.talhoes.some((t) => t.id === talhaoId) ? talhaoId : farm.talhoes[0].id;
+    this.ensureRoot();
+    this.root!.style.display = 'flex';
+    this.loadNasa();
+    this.render();
+    void loadMarket().then(() => { if (this.root && this.root.style.display !== 'none') this.render(); });
+  }
+
+  close(): void {
+    if (this.root) this.root.style.display = 'none';
+  }
+
+  private ensureRoot(): void {
+    if (this.root) return;
+    this.root = document.createElement('div');
+    this.root.className = 'rot-overlay';
+    document.body.appendChild(this.root);
+  }
+
+  private bindClose(): void {
+    this.root!.querySelector('[data-act=close]')?.addEventListener('click', () => this.close());
+    this.root!.onclick = (e) => { if (e.target === this.root) this.close(); };
+  }
+
+  private talhao(): Talhao {
+    return this.opts.getFarm().talhoes.find((t) => t.id === this.talhaoId)!;
+  }
+
+  private plan() {
+    const t = this.talhao();
+    if (!t.rotationPlan || !t.rotationPlan.strategies?.length) {
+      t.rotationPlan = { summerSow: defaultSummerSow(t, this.opts.getRefDate()), strategies: defaultStrategies(t) };
+    }
+    if (!t.rotationPlan.summerSow) t.rotationPlan.summerSow = defaultSummerSow(t, this.opts.getRefDate());
+    return t.rotationPlan;
+  }
+
+  private cropName = (c: CropKey): string => {
+    if (c === 'cobertura') return rt('cover').split(' (')[0];
+    if (c === 'pousio') return rt('fallow').split(' (')[0];
+    return translateCropName(CROP_STANDARD_NAME[c]);
+  };
+
+  private loadNasa(): void {
+    const t = this.talhao();
+    const token = ++this.nasaToken;
+    this.nasa = null;
+    if (!t.coordinates || t.coordinates.length < 3) {
+      this.nasaState = 'fail';
+      return;
+    }
+    this.nasaState = 'loading';
+    const ref = this.opts.getRefDate();
+    const c = polygonCentroid(t.coordinates);
+    fetchNasaSeries(c.lat, c.lng, ref, 30)
+      .then((series) => {
+        if (token !== this.nasaToken) return;
+        const phase = calculateTalhaoCropStatus(t, ref).phase.key;
+        const inCycle = !!t.plantingDate && phase !== 'preparo';
+        const a = assessPlanting(series, ref, t.diary, inCycle);
+        this.nasa = { level: a.level, rain15: a.rain15 };
+        this.nasaState = 'ok';
+        this.render();
+        // Balanço hídrico de 30 dias + umidade do solo (ERA5-Land): risco hídrico alto sobe o risco em um nível.
+        void waterForPoint(c.lat, c.lng).then((w) => {
+          if (token !== this.nasaToken || !w || w.level !== 'high' || !this.nasa) return;
+          const steps = ['low', 'medium', 'high'] as const;
+          this.nasa = { ...this.nasa, level: steps[Math.min(2, steps.indexOf(this.nasa.level) + 1)] };
+          this.render();
+        });
+      })
+      .catch(() => {
+        if (token !== this.nasaToken) return;
+        this.nasaState = 'fail';
+        this.render();
+      });
+  }
+
+  private riskLabel(l: 'low' | 'medium' | 'high'): string {
+    return rt(l === 'low' ? 'riskLow' : l === 'medium' ? 'riskMedium' : 'riskHigh');
+  }
+
+  private cropOptions(selected: string, season: 'summer' | 'second'): string {
+    const keys = CROP_KEYS.filter((k) => (season === 'summer' ? k !== 'cobertura' : true));
+    return keys.map((k) => `<option value="${k}" ${k === selected ? 'selected' : ''}>${esc(this.cropName(k))}</option>`).join('');
+  }
+
+  private findingHtml(f: Finding): string {
+    const params: Record<string, string | number> = { ...f.params };
+    const text = rt(f.key, params);
+    const src = f.source === 'NASA POWER' ? `<span class="rot-nasa">${rt('nasaBadge')}</span>` : f.source === 'Embrapa' ? '<span class="rot-src">Embrapa</span>' : '';
+    return `<li class="rot-f sev${f.sev}">${esc(text)} ${src}</li>`;
+  }
+
+  private evidenceChip(c: CropKey, ev: Evaluation['evidence']['summer']): string {
+    if (!ev) return '';
+    const label = rt(ev === 'model' ? 'evModel' : ev === 'trend' ? 'evTrend' : 'evRules');
+    return `<span class="rot-ev ev-${ev}">${esc(this.cropName(c))}: ${esc(label)}</span>`;
+  }
+
+  private yieldLine(c: CropKey, y: Evaluation['yields']['summer']): string {
+    if (c === 'pousio' || c === 'cobertura') return '';
+    const txt = y ? rt('yieldVal', { v: y.value.toFixed(1).replace('.', ','), n: y.n }) : rt('yieldNone');
+    return `<div class="rot-yield">${esc(this.cropName(c))} — ${rt('yieldRef')}: <strong>${esc(txt)}</strong></div>`;
+  }
+
+
+  private money(v: number): string { return fmtMoney(v); }
+
+  private strategyName(ev: Evaluation): string {
+    const a = this.cropName(ev.summer.crop);
+    return ev.second ? `${a} → ${this.cropName(ev.second.crop)}` : a;
+  }
+
+  private spark(series?: number[]): string {
+    if (!series || series.length < 2) return '';
+    const w = 70, h = 22, mn = Math.min(...series), mx = Math.max(...series), r = mx - mn || 1;
+    const pts = series.map((v, i) => `${((i / (series.length - 1)) * w).toFixed(1)},${(h - 2 - ((v - mn) / r) * (h - 4)).toFixed(1)}`).join(' ');
+    const up = series[series.length - 1] >= series[0];
+    return `<svg class="mk-spark" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" aria-hidden="true"><polyline points="${pts}" fill="none" stroke="${up ? '#22c55e' : '#f87171'}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/></svg>`;
+  }
+
+  private marketPanel(crops: CropKey[]): string {
+    const md = currentMarket();
+    const rows = crops.map((c) => {
+      const cm = cropMarket(c);
+      if (!cm || c === 'cobertura') return '';
+      const { m, edited } = cm;
+      const trendTxt = `${m.trend12m > 0 ? '+' : ''}${m.trend12m}%`;
+      const arrow = m.trend12m >= 0 ? '▲' : '▼';
+      return `<tr>
+        <td>${esc(this.cropName(c))} ${m.example === false ? `<span class="mk-tag real" title="${esc(m.source || '')} ${esc((m.asOf || '').slice(0, 7))}">${mt('realTag')}</span>` : ''}</td>
+        <td><input type="number" min="0" step="0.5" class="mk-in ${edited.price ? 'edited' : ''}" data-mk="price" data-crop="${c}" value="${round2(toCur(m.price))}" title="${esc(mt('yourValue'))}" aria-label="${esc(mt('price'))} ${esc(this.cropName(c))}" /> <span class="mk-unit">${esc(curSymbol())}/${m.unit}</span></td>
+        <td class="${m.trend12m >= 0 ? 'mk-up' : 'mk-down'}">${arrow} ${trendTxt} ${this.spark(m.series)}</td>
+        <td><input type="number" min="0" step="50" class="mk-in ${edited.cost ? 'edited' : ''}" data-mk="cost" data-crop="${c}" value="${Math.round(toCur(m.cost))}" title="${esc(mt('yourValue'))}" aria-label="${esc(mt('cost'))} ${esc(this.cropName(c))}" /></td>
+      </tr>`;
+    }).join('');
+    const badge = md.example || crops.every((c) => cropMarket(c)?.m.example !== false) ? '' : `<span class="mk-badge real">${mt('realBadge')}</span>`;
+    const note = md.example ? '' : mt('realNote', { src: md.source, date: (md.asOf || '').slice(0, 7) });
+    const sv = this.stress;
+    const stressTxt = sv === 0 ? '0%' : `${sv > 0 ? '+' : ''}${sv}%`;
+    return `
+      <div class="mk-panel">
+        <div class="mk-head"><strong>${mt('title')}</strong> ${badge}${hasOverrides() ? `<button class="mk-reset" data-act="mk-reset">${mt('reset')}</button>` : ''}</div>
+        <p class="mk-note">${esc(note)}</p>
+        <div class="mk-tbl-wrap"><table class="mk-tbl"><thead><tr><th>${mt('crop')}</th><th>${mt('price')}</th><th>${mt('trend')}</th><th>${mt('cost')}</th></tr></thead><tbody>${rows}</tbody></table></div>
+        <div class="mk-stress">
+          <label for="mk-stress"><strong>${mt('stress')}</strong>: <span id="mk-stress-val">${mt('stressNow', { v: stressTxt })}</span></label>
+          <input type="range" id="mk-stress" min="-40" max="40" step="5" value="${sv}" />
+          <div class="mk-stress-help">${mt('stressHelp')}</div>
+        </div>
+      </div>`;
+  }
+
+  private marginBlock(mg: StrategyMargin, area: number, best: boolean, ev: Evaluation): string {
+    if (!mg.slots.length) return `<div class="mk-margin"><div class="mk-none">${mt('noMarket')}</div></div>`;
+    const sc: Scenario[] = ['pess', 'base', 'opt'];
+    const label: Record<Scenario, string> = { pess: mt('pess'), base: mt('base'), opt: mt('opt') };
+    const cells = sc.map((k) => {
+      const v = mg.perHa[k];
+      return `<div class="mk-cell ${k} ${v < 0 ? 'neg' : 'pos'}"><span>${label[k]}</span><strong>${this.money(v)}</strong><em>${this.money(v * area)}</em></div>`;
+    }).join('');
+    const adj = mg.slots.map((s) => `${this.cropName(s.crop)}: ${mt('yieldAdj', { v: s.yieldUsed.toFixed(s.yieldUsed < 20 ? 1 : 0).replace('.', ','), u: s.unit })}`).join(' • ');
+    const basis = mg.slots.map((s) => {
+      const d = `${s.driftPct >= 0 ? '+' : ''}${s.driftPct.toFixed(1).replace('.', ',')}%`;
+      return `${this.cropName(s.crop)}: ${s.basis === 'futures' ? mk2('basisFut', { c: s.contract || '', p: d }) : mk2('basisTrend', { p: d })}`;
+    }).join(' • ');
+    const cover = [ev.summer.crop, ev.second?.crop].includes('cobertura') ? `<div class="mk-cover">${mt('cover')}</div>` : '';
+    return `
+      <div class="mk-margin ${best ? 'best' : ''}">
+        <div class="mk-m-head"><strong>${mt('margin')}</strong> <span>${mt('perHa')} • <em>${mt('total', { ha: area.toFixed(1).replace('.', ',') })}</em></span>${best ? `<span class="mk-best">${mt('best')}</span>` : ''}</div>
+        <div class="mk-cells">${cells}</div>
+        ${mg.perHa.pess < 0 ? `<div class="mk-loss">${mt('loss')}</div>` : ''}
+        <div class="mk-adj">${esc(adj)}</div><div class="mk-adj">${esc(basis)}</div>${cover}
+      </div>`;
+  }
+
+
+  private static ICON: Record<string, string> = { soja: '', milho: '', sorgo: '', feijao: '', algodao: '', trigo: '', cana: '', pasto: '', cobertura: '', pousio: '' };
+  private ic(c: CropKey): string { return RotationPlanner.ICON[c] || ''; }
+
+  private decisionBanner(d: Decision, area: number): string {
+    if (d.bestIdx < 0) return `<div class="mk-decision none">${mt('decisionNone')}</div>`;
+    const ev = d.evals[d.bestIdx];
+    const m = d.margins[d.bestIdx].perHa.base;
+    if (m < 0) return `<div class="mk-decision none"><strong>${mt('decision')}</strong><div>${esc(mt('decisionLoss', { name: this.strategyName(ev), m: this.money(m) }))}</div></div>`;
+    const text = mt('decisionText', { name: this.strategyName(ev), m: this.money(m), risk: this.riskLabel(ev.level), t: this.money(m * area) });
+    return `<div class="mk-decision"><strong>${mt('decision')}</strong><div>${esc(text)}</div></div>`;
+  }
+
+  /** Ranking visual: barra = margem base por hectare; traço = pessimista a otimista. */
+  private chart(plan: ReturnType<RotationPlanner['plan']>, d: Decision): string {
+    const all = d.margins.flatMap((m) => [m.perHa.pess, m.perHa.opt, m.perHa.base]);
+    const lo = Math.min(0, ...all), hi = Math.max(1, ...all), span = hi - lo || 1;
+    const pos = (v: number) => (((v - lo) / span) * 100).toFixed(1);
+    const zero = pos(0);
+    const rows = plan.strategies.map((s, i) => {
+      const ev = d.evals[i], mg = d.margins[i];
+      const base = mg.perHa.base;
+      const left = Math.min(Number(zero), Number(pos(base))), width = Math.abs(Number(pos(base)) - Number(zero));
+      const kind = s.kind === 'current' ? rt('current') : s.kind === 'suggested' ? `${rt('suggested')} ${s.name}` : `${rt('custom')} ${s.name}`;
+      const best = i === d.bestIdx;
+      const icons = `${this.ic(ev.summer.crop)}${ev.second ? this.ic(ev.second.crop) : ''}`;
+      return `
+        <div class="sf-row ${best ? 'best' : ''}">
+          <div class="sf-label"><span class="sf-ic">${icons}</span><div><strong>${esc(this.strategyName(ev))}</strong><small>${esc(kind)}</small></div></div>
+          <div class="sf-bar" aria-label="${esc(this.money(base))}">
+            <span class="sf-zero" style="left:${zero}%"></span>
+            <span class="sf-fill ${base < 0 ? 'neg' : 'pos'}" style="left:${left}%;width:${width}%"></span>
+            <span class="sf-whisk" style="left:${pos(mg.perHa.pess)}%;width:${Math.max(0, Number(pos(mg.perHa.opt)) - Number(pos(mg.perHa.pess))).toFixed(1)}%"></span>
+          </div>
+          <div class="sf-val ${base < 0 ? 'neg' : ''}"><strong>${this.money(base)}</strong><small>${mt('perHa')}</small></div>
+          <span class="rot-level lvl-${ev.level}">${this.riskLabel(ev.level)}</span>
+          <button class="rot-adopt sf-adopt" data-act="adopt" data-id="${esc(s.id)}">${best ? '' : ''}${sf('adopt')}</button>
+        </div>`;
+    }).join('');
+    return `<div class="sf-chart"><h3>${sf('chartTitle')}</h3><p class="sf-sub">${sf('chartSub')}</p>${rows}</div>`;
+  }
+
+  private monthTicks(a: string, b: string): string {
+    const total = Math.max(1, diffDays(a, b));
+    const ticks: { pct: number; txt: string }[] = [];
+    let y = Number(a.slice(0, 4)), m = Number(a.slice(5, 7)) + 1;
+    for (let k = 0; k < 24; k++) {
+      if (m > 12) { m = 1; y++; }
+      const iso = `${y}-${String(m).padStart(2, '0')}-01`;
+      const off = diffDays(a, iso);
+      if (off > total) break;
+      ticks.push({ pct: (off / total) * 100, txt: `${String(m).padStart(2, '0')}/${String(y).slice(2)}` });
+      m++;
+    }
+    // no máximo ~6 datas escritas (as outras ficam só com o tracinho), para não encavalarem em tela estreita
+    const step = Math.max(1, Math.ceil(ticks.length / 6));
+    return ticks.map((tk, i) => `<span class="sf-tick" style="left:${tk.pct.toFixed(2)}%">${i % step === 0 ? tk.txt : ''}</span>`).join('');
+  }
+
+  private currentTab(): string {
+    const farm = this.opts.getFarm();
+    const ref = this.opts.getRefDate();
+    if (!farm.talhoes.length) return `<p>${sf('noFields')}</p>`;
+    type Row = { t: Talhao; st: ReturnType<typeof calculateTalhaoCropStatus>; ps: string | null; hv: string | null };
+    const rows: Row[] = farm.talhoes.map((t) => {
+      const st = calculateTalhaoCropStatus(t, ref);
+      const ps = t.plantingDate && t.cycleDays ? t.plantingDate : null;
+      const hv = ps ? (t.harvestDateExpected || calculateExpectedHarvestDate(ps, t.cycleDays!)) : null;
+      return { t, st, ps, hv };
+    });
+    const dated = rows.filter((r) => r.ps && r.hv);
+    let a = addDaysToDate(ref, -40), b = addDaysToDate(ref, 160);
+    dated.forEach((r) => { if (r.ps! < a) a = r.ps!; if (r.hv! > b) b = r.hv!; });
+    if (diffDays(a, b) > 420) { a = addDaysToDate(ref, -90); b = addDaysToDate(ref, 330); }
+    const total = Math.max(1, diffDays(a, b));
+    const pct = (iso: string) => Math.max(0, Math.min(100, (diffDays(a, iso) / total) * 100));
+    const todayPct = pct(ref).toFixed(2);
+    const area = rows.reduce((s, r) => s + (Number(r.t.areaHectares) || 0), 0);
+    const upcoming = rows.filter((r) => r.hv && !r.st.isPasture && diffDays(ref, r.hv) >= 0).sort((x, y) => diffDays(ref, x.hv!) - diffDays(ref, y.hv!))[0];
+    const chips = `<div class="sf-chips"><span>${sf('chipFields', { n: rows.length })}</span><span>${sf('chipArea', { ha: Math.round(area).toLocaleString() })}</span><span>${upcoming ? sf(diffDays(ref, upcoming.hv!) === 0 ? 'chipHarvestToday' : 'chipHarvest', { name: esc(upcoming.t.name.replace(/\s*\[[^\]]*\]\s*/, '')), d: diffDays(ref, upcoming.hv!) }) : sf('chipNone')}</span></div>`;
+    const over = (r: Row) => (r.hv && diffDays(r.hv, ref) > 0 ? 1 : 0);
+    rows.sort((x, y) => over(x) - over(y) || (x.hv || '9999').localeCompare(y.hv || '9999'));
+    const html = rows.map((r) => {
+      const { t, st } = r;
+      const key = asCropKey(t.crop);
+      const color = getCropColor(t.crop);
+      const nm = esc(t.name.replace(/\s*\[[^\]]*\]\s*/, ''));
+      const crop = esc(translateCropName(t.crop) || sf('noCrop'));
+      let bar = '', meta = '';
+      if (st.isPasture) {
+        bar = `<span class="sf-seg pasture" style="left:0;width:100%;background:${color}"></span>`;
+        meta = sf('pasture');
+      } else if (r.ps && r.hv) {
+        const l = pct(r.ps), w = Math.max(1.5, pct(r.hv) - l);
+        const doneDays = Math.max(0, Math.min(diffDays(r.ps, r.hv), diffDays(r.ps, ref)));
+        const fill = Math.max(0, Math.min(100, (doneDays / Math.max(1, diffDays(r.ps, r.hv))) * 100));
+        const harvested = diffDays(r.hv, ref) > 0;
+        bar = `<span class="sf-seg ${harvested ? 'harvested' : ''}" style="left:${l.toFixed(2)}%;width:${w.toFixed(2)}%;background:${color}33;border-color:${color}"><i style="width:${fill.toFixed(0)}%;background:${color}"></i></span>`;
+        const left = diffDays(ref, r.hv);
+        meta = harvested ? sf('done') : `${sf('dayOf', { d: Math.max(0, diffDays(r.ps, ref)), t: t.cycleDays! })} · ${sf('harvestOn', { date: r.hv.slice(8, 10) + '/' + r.hv.slice(5, 7) })} · ${sf('daysLeft', { d: left })}`;
+      } else meta = sf('noCrop');
+      const np = t.nextCropPlan?.plannedPlanting && t.nextCropPlan.crop ? t.nextCropPlan : null;
+      if (np && np.plannedPlanting) {
+        const l = pct(np.plannedPlanting), e = np.plannedHarvest ? pct(np.plannedHarvest) : Math.min(100, l + 20);
+        bar += `<span class="sf-seg next" style="left:${l.toFixed(2)}%;width:${Math.max(1.5, e - l).toFixed(2)}%"></span>`;
+        meta += ` · ${sf('next', { crop: esc(translateCropName(np.crop) || '') })}`;
+      }
+      const fc = !st.isPasture ? currentForecast(t) : null;
+      const fcTxt = fc && fc.value !== null ? ` · ${sf('forecast', { v: fc.value.toFixed(0) })}` : '';
+      return `
+        <div class="sf-trow" data-talhao="${esc(t.id)}">
+          <div class="sf-tname"><span class="sf-dot" style="background:${color}"></span><div><strong>${nm}</strong><small>${this.ic(key)} ${crop} · ${esc(st.stageBadgeText)}</small></div></div>
+          <div class="sf-track">${bar}<span class="sf-now" style="left:${todayPct}%"></span></div>
+          <div class="sf-meta">${esc(meta)}${esc(fcTxt)}</div>
+          <button class="sf-go" data-act="decide" data-id="${esc(t.id)}">${sf('decide')}</button>
+        </div>`;
+    }).join('');
+    return `
+      <h3 class="sf-h">${sf('curTitle')}</h3><p class="sf-sub">${sf('curSub')}</p>
+      ${chips}
+      <div class="sf-gantt">
+        <div class="sf-trow sf-axis"><div class="sf-tname"></div><div class="sf-track"><span class="sf-todaytag" style="left:${todayPct}%">${sf('today')}</span>${this.monthTicks(a, b)}</div><div class="sf-meta"></div><div></div></div>
+        ${html}
+      </div>`;
+  }
+
+  /** Dados agronômicos em que a melhor opção se apoia, em linguagem simples. */
+  private whyBlock(d: Decision, t: Talhao): string {
+    if (d.bestIdx < 0) return `<div class="sf-why"><h3>${rt('whyTitle')}</h3><p>${rt('whyNone')}</p></div>`;
+    const ev = d.evals[d.bestIdx];
+    const winKeys = ['windowOk', 'windowEarly', 'windowLate', 'windowOut', 'notForSeason'];
+    const win = ev.findings.find((f) => winKeys.includes(f.key));
+    const rain = this.nasaState === 'ok' && this.nasa
+      ? rt('whyRainVal', { mm: this.nasa.rain15, risk: this.riskLabel(this.nasa.level) })
+      : this.nasaState === 'loading' ? rt('nasaLoading') : rt('nasaFail');
+    const y = ev.yields.summer;
+    const yTxt = ev.summer.crop === 'pousio' || ev.summer.crop === 'cobertura' ? '' : y ? rt('yieldVal', { v: y.value.toFixed(1).replace('.', ','), n: y.n }) : rt('yieldNone');
+    const cyc = [ev.summer, ev.second].filter(Boolean).filter((x) => x!.crop !== 'pousio').map((x) => `${esc(this.cropName(x!.crop))}: ${fmtDate(x!.sow)} → ${fmtDate(x!.harvest)}`).join('<br>');
+    const basis = [this.evidenceChipText(ev.summer.crop, ev.evidence.summer), ev.second ? this.evidenceChipText(ev.second.crop, ev.evidence.second) : ''].filter(Boolean).join('<br>');
+    const row = (k: string, v: string) => (v ? `<tr><th>${k}</th><td>${v}</td></tr>` : '');
+    const pros = ev.findings.filter((f) => f.kind === 'benefit').slice(0, 3);
+    const cons = ev.findings.filter((f) => f.kind === 'risk').slice(0, 3);
+    const ul = (arr: Finding[]) => `<ul>${arr.map((f) => this.findingHtml(f)).join('')}</ul>`;
+    return `<div class="sf-why"><h3>${rt('whyTitle')}</h3><p class="sf-sub">${rt('whyIntro', { name: esc(this.strategyName(ev)) })}</p>
+      <table class="sf-why-tbl">
+        ${row(`${rt('whyRain')} <span class="rot-nasa">${rt('nasaBadge')}</span>`, esc(rain))}
+        ${row(rt('whyWindow'), win ? esc(rt(win.key, { ...win.params })) : '')}
+        ${row(rt('whyYield'), esc(yTxt))}
+        ${row(rt('whyCycle'), cyc)}
+        ${row(rt('whyBasis'), basis)}
+      </table>
+      <div class="sf-why-cols">
+        ${pros.length ? `<div><h4>${rt('whyPros')}</h4>${ul(pros)}</div>` : ''}
+        ${cons.length ? `<div><h4>${rt('whyCons')}</h4>${ul(cons)}</div>` : ''}
+      </div></div>`;
+  }
+
+  private evidenceChipText(c: CropKey, ev: Evaluation['evidence']['summer']): string {
+    if (!ev || c === 'pousio' || c === 'cobertura') return '';
+    return `${esc(this.cropName(c))}: ${esc(rt(ev === 'model' ? 'evModel' : ev === 'trend' ? 'evTrend' : 'evRules'))}`;
+  }
+
+  private card(s: RotationStrategyData, ev: Evaluation, idx: number, marketHtml = ''): string {
+    const kindLabel = s.kind === 'current' ? rt('current') : s.kind === 'suggested' ? `${rt('suggested')} ${esc(s.name)}` : `${rt('custom')} ${esc(s.name)}`;
+    const lvl = ev.level;
+    const levelText = rt(lvl === 'low' ? 'levelLow' : lvl === 'medium' ? 'levelMedium' : 'levelHigh');
+    const ben = ev.findings.filter((f) => f.kind === 'benefit');
+    const risk = ev.findings.filter((f) => f.kind === 'risk');
+    const gaps = ev.findings.filter((f) => f.kind === 'gap');
+    const list = (arr: Finding[]) => (arr.length ? `<ul>${arr.map((f) => this.findingHtml(f)).join('')}</ul>` : `<div class="rot-none">${rt('none')}</div>`);
+    const sec = ev.second;
+    return `
+      <div class="rot-strategy lvl-${lvl}" data-id="${esc(s.id)}">
+        <div class="rot-s-head">
+          <span class="rot-kind">${kindLabel}</span>
+          <span class="rot-level lvl-${lvl}">${levelText}</span>
+        </div>
+        <div class="rot-slots">
+          <label>${rt('summer')}
+            <select data-f="summer" data-id="${esc(s.id)}">${this.cropOptions(s.summer.crop, 'summer')}</select>
+          </label>
+          <label class="rot-cyc">${rt('cycle')}
+            <input type="number" min="0" max="400" value="${s.summer.cycle}" data-f="summerCycle" data-id="${esc(s.id)}" />
+          </label>
+          <label>${rt('second')}
+            <select data-f="second" data-id="${esc(s.id)}">${this.cropOptions(s.second.crop, 'second')}</select>
+          </label>
+          <label class="rot-cyc">${rt('cycle')}
+            <input type="number" min="0" max="400" value="${s.second.cycle}" data-f="secondCycle" data-id="${esc(s.id)}" />
+          </label>
+        </div>
+        <div class="rot-timeline">
+          ${ev.summer.crop !== 'pousio' ? `<div>${esc(this.cropName(ev.summer.crop))}: ${rt('sow')} ${fmtDate(ev.summer.sow)} → ${rt('harvest')} ${fmtDate(ev.summer.harvest)}</div>` : ''}
+          ${sec ? `<div>${esc(this.cropName(sec.crop))}: ${rt('sow')} ${fmtDate(sec.sow)} → ${rt('harvest')} ${fmtDate(sec.harvest)}</div>` : ''}
+        </div>
+        ${this.yieldLine(ev.summer.crop, ev.yields.summer)}
+        ${sec ? this.yieldLine(sec.crop, ev.yields.second) : ''}
+        <div class="rot-evs">${this.evidenceChip(ev.summer.crop, ev.evidence.summer)}${sec ? this.evidenceChip(sec.crop, ev.evidence.second) : ''}</div>
+        ${marketHtml}
+        <div class="rot-sec ben"><h4>${rt('benefits')}</h4>${list(ben)}</div>
+        <div class="rot-sec risk"><h4>${rt('risks')}</h4>${list(risk)}</div>
+        <div class="rot-sec gap"><h4>${rt('gaps')}</h4>${list(gaps)}</div>
+        <div class="rot-actions">
+          <button class="rot-adopt" data-act="adopt" data-id="${esc(s.id)}">${rt('adopt')}</button>
+          ${s.kind === 'custom' || idx > 2 ? `<button class="rot-rm" data-act="remove" data-id="${esc(s.id)}">${rt('remove')}</button>` : ''}
+        </div>
+      </div>`;
+  }
+
+  private render(): void {
+    if (!this.root) return;
+    const farm = this.opts.getFarm();
+    const t = this.talhao();
+    const plan = this.plan();
+    const ref = this.opts.getRefDate();
+    const tabs = `<div class="sf-tabs" role="tablist">
+        <button role="tab" class="sf-tab ${this.tab === 'current' ? 'on' : ''}" data-act="tab" data-tab="current">${sf('tabCurrent')}</button>
+        <button role="tab" class="sf-tab ${this.tab === 'switch' ? 'on' : ''}" data-act="tab" data-tab="switch">${sf('tabSwitch')}</button>
+      </div>`;
+    let body = '';
+    if (this.tab === 'current') {
+      body = this.currentTab();
+    } else {
+      const d = decide(t, ref, this.cropName, this.nasa, this.stress);
+      const area = Math.max(0, Number(t.areaHectares) || 0);
+      const usedCrops = Array.from(new Set(d.evals.flatMap((ev) => [ev.summer.crop, ev.second?.crop].filter(Boolean) as CropKey[]))).filter((c) => c !== 'pousio');
+      body = `
+        <div class="rot-controls">
+          <label>${rt('talhao')}
+            <select id="rot-talhao">${farm.talhoes.map((x) => `<option value="${esc(x.id)}" ${x.id === this.talhaoId ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}</select>
+          </label>
+          <label>${rt('sowDate')}
+            <input type="date" id="rot-sow" value="${plan.summerSow}" />
+          </label>
+        </div>
+        ${this.decisionBanner(d, area)}
+        ${this.chart(plan, d)}
+        ${this.whyBlock(d, t)}
+        <details class="sf-details" ${this.detailsOpen ? 'open' : ''}>
+          <summary>${sf('details')}</summary>
+          ${this.marketPanel(usedCrops)}
+          <div class="rot-grid">${plan.strategies.map((s, i) => this.card(s, d.evals[i], i, this.marginBlock(d.margins[i], area, i === d.bestIdx, d.evals[i]))).join('')}</div>
+          <div class="rot-bottom">
+            <button class="rot-add" data-act="add">${rt('add')}</button>
+            <p class="rot-foot">${rt('foot')}</p>
+            <p class="rot-foot">${mt('foot')}</p>
+          </div>
+        </details>`;
+    }
+    this.root.innerHTML = `
+      <div class="rot-card" role="dialog" aria-label="${sf('hub')}">
+        <div class="rot-head">
+          <div><h2>${sf('hub')}</h2></div>
+          <button class="rot-x" data-act="close" aria-label="${rt('close')}">&times;</button>
+        </div>
+        ${tabs}
+        ${body}
+      </div>`;
+    this.bind(plan.strategies);
+  }
+
+  private bind(strategies: RotationStrategyData[]): void {
+    const root = this.root!;
+    this.bindClose();
+    const t = this.talhao();
+    const plan = this.plan();
+    const persist = () => this.opts.onChange(t, false);
+
+    root.querySelector<HTMLDetailsElement>('.sf-details')?.addEventListener('toggle', (e) => { this.detailsOpen = (e.target as HTMLDetailsElement).open; });
+    root.querySelectorAll<HTMLButtonElement>('[data-act=tab]').forEach((b) => {
+      b.onclick = () => { this.tab = b.dataset.tab as 'current' | 'switch'; this.render(); };
+    });
+    root.querySelectorAll<HTMLButtonElement>('[data-act=decide]').forEach((b) => {
+      b.onclick = () => { this.talhaoId = b.dataset.id!; this.tab = 'switch'; this.loadNasa(); this.render(); };
+    });
+    root.querySelectorAll<HTMLElement>('.sf-trow[data-talhao]').forEach((r) => {
+      r.onclick = (e) => { if ((e.target as HTMLElement).closest('button')) return; this.talhaoId = r.dataset.talhao!; this.tab = 'switch'; this.loadNasa(); this.render(); };
+    });
+    const sel = root.querySelector<HTMLSelectElement>('#rot-talhao');
+    if (sel) sel.onchange = (e) => {
+      this.talhaoId = (e.target as HTMLSelectElement).value;
+      this.loadNasa();
+      this.render();
+    };
+    const sow = root.querySelector<HTMLInputElement>('#rot-sow');
+    if (sow) sow.onchange = (e) => {
+      const v = (e.target as HTMLInputElement).value;
+      if (/^\d{4}-\d{2}-\d{2}$/.test(v)) { plan.summerSow = v; persist(); this.render(); }
+    };
+    root.querySelectorAll<HTMLSelectElement | HTMLInputElement>('[data-f]').forEach((el) => {
+      el.onchange = () => {
+        const s = strategies.find((x) => x.id === el.dataset.id);
+        if (!s) return;
+        const f = el.dataset.f!;
+        if (f === 'summer') { s.summer.crop = el.value; s.summer.cycle = DEFAULT_CYCLE[el.value as CropKey]; if (ROTATION_RULES.perennial.includes(el.value as CropKey)) { s.second.crop = 'pousio'; s.second.cycle = 0; } }
+        else if (f === 'second') { s.second.crop = el.value; s.second.cycle = DEFAULT_CYCLE[el.value as CropKey]; }
+        else if (f === 'summerCycle') s.summer.cycle = Math.max(0, Number(el.value) || 0);
+        else if (f === 'secondCycle') s.second.cycle = Math.max(0, Number(el.value) || 0);
+        if (s.kind === 'suggested') s.kind = 'custom';
+        persist();
+        this.render();
+      };
+    });
+    root.querySelectorAll<HTMLInputElement>('input[data-mk]').forEach((el) => {
+      el.onchange = () => {
+        const typed = el.value.trim() === '' ? null : Number(el.value.replace(',', '.'));
+        // o produtor digita na moeda do idioma; o valor é guardado em reais
+        const v = typed === null ? null : fromCur(typed);
+        setOverride(el.dataset.crop as CropKey, el.dataset.mk as 'price' | 'cost', v);
+        this.render();
+      };
+    });
+    root.querySelector<HTMLButtonElement>('[data-act=mk-reset]')?.addEventListener('click', () => { clearOverrides(); this.render(); });
+    const st = root.querySelector<HTMLInputElement>('#mk-stress');
+    if (st) {
+      st.oninput = () => {
+        const v = Number(st.value);
+        const lab = root.querySelector('#mk-stress-val');
+        if (lab) lab.textContent = mt('stressNow', { v: v === 0 ? '0%' : `${v > 0 ? '+' : ''}${v}%` });
+      };
+      st.onchange = () => { this.stress = Number(st.value); this.render(); };
+    }
+    root.querySelector('[data-act=add]')?.addEventListener('click', () => {
+      plan.strategies.push(newCustomStrategy(plan.strategies.filter((x) => x.kind === 'custom').length + 1));
+      persist();
+      this.render();
+    });
+    root.querySelectorAll<HTMLButtonElement>('[data-act=remove]').forEach((b) => {
+      b.onclick = () => {
+        if (plan.strategies.length <= 3) return;
+        plan.strategies = plan.strategies.filter((x) => x.id !== b.dataset.id);
+        persist();
+        this.render();
+      };
+    });
+    root.querySelectorAll<HTMLButtonElement>('[data-act=adopt]').forEach((b) => {
+      b.onclick = () => this.adopt(strategies.find((x) => x.id === b.dataset.id)!);
+    });
+  }
+
+  /** Define a próxima safra do talhão a partir da estratégia escolhida. */
+  private adopt(s: RotationStrategyData): void {
+    const t = this.talhao();
+    const plan = this.plan();
+    const ref = this.opts.getRefDate();
+    const phase = calculateTalhaoCropStatus(t, ref).phase.key;
+    const inCycle = !!t.plantingDate && phase !== 'preparo' && asCropKey(t.crop) !== 'pasto';
+    const useSecond = inCycle && s.second.crop !== 'pousio';
+    const slotData = useSecond ? s.second : s.summer;
+    const crop = slotData.crop as CropKey;
+    const std = CROP_STANDARD_NAME[crop];
+    if (!std) {
+      this.toast(rt('adoptNo'));
+      return;
+    }
+    const ev = evaluateStrategy(s, t, plan.summerSow!, ref, this.cropName, this.nasa);
+    const target = useSecond ? ev.second : ev.summer;
+    if (!target) { this.toast(rt('adoptNo')); return; }
+    t.nextCropPlan = {
+      crop: std,
+      plannedPlanting: target.sow,
+      plannedHarvest: target.harvest,
+      cycleDays: slotData.cycle || undefined,
+    };
+    this.opts.onChange(t, true);
+    this.toast(rt('adopted'));
+    this.render();
+  }
+
+  private toast(msg: string): void {
+    const el = document.createElement('div');
+    el.className = 'rot-toast';
+    el.textContent = msg;
+    document.body.appendChild(el);
+    window.setTimeout(() => el.remove(), 2600);
+  }
+}
+void addDaysToDate;
+
+/** Resumo da melhor opção de troca de safra para a tela Hoje (sem consultar a NASA). */
+export function switchHeadline(farm: FarmData, ref: string): { field: string; text: string; example: boolean } | null {
+  const t = focusTalhao(farm, ref);
+  if (!t) return null;
+  const d = decide(t, ref, cropLabel, null, 0);
+  if (d.bestIdx < 0) return null;
+  const ev = d.evals[d.bestIdx];
+  const name = ev.second ? `${cropLabel(ev.summer.crop)} → ${cropLabel(ev.second.crop)}` : cropLabel(ev.summer.crop);
+  const risk = rt(ev.level === 'low' ? 'riskLow' : ev.level === 'medium' ? 'riskMedium' : 'riskHigh');
+  return { field: t.name.replace(/\s*\[[^\]]*\]\s*/, ''), text: sf('heroSwitchText', { field: t.name.replace(/\s*\[[^\]]*\]\s*/, ''), name, m: fmtMoney(d.margins[d.bestIdx].perHa.base), risk }), example: d.margins[d.bestIdx].slots.some((sl) => cropMarket(sl.crop)?.m.example !== false) };
+}
